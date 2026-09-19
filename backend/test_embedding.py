@@ -1,24 +1,22 @@
-from sentence_transformers import SentenceTransformer
+import os
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+if __name__ == "__main__":
+    from sentence_transformers import SentenceTransformer
 
-print("Loading embedding model...")
+    MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-model = SentenceTransformer(MODEL_NAME)
+    print("Loading embedding model...")
+    model = SentenceTransformer(MODEL_NAME)
+    print("Model loaded successfully.")
 
-print("Model loaded successfully.")
+    text = "Ground floor plan"
+    embedding = model.encode(text)
 
-text = "Ground floor plan"
-
-embedding = model.encode(text)
-
-print("Text:")
-print(text)
-
-print()
-print("Embedding dimension:")
-print(len(embedding))
-
-print()
-print("First 10 values:")
-print(embedding[:10])
+    print("Text:")
+    print(text)
+    print()
+    print("Embedding dimension:")
+    print(len(embedding))
+    print()
+    print("First 10 values:")
+    print(embedding[:10])

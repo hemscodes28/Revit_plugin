@@ -683,6 +683,11 @@ namespace RevitPlugin
                         request,
                         "revit_view_id");
 
+                long? revitElementId =
+                    ExtractJsonLongValue(
+                        request,
+                        "revit_element_id");
+
                 int? projectId =
                     (int?)ExtractJsonLongValue(
                         request,
@@ -698,6 +703,8 @@ namespace RevitPlugin
                     type +
                     " | RevitViewId: " +
                     (revitViewId?.ToString() ?? "null") +
+                    " | RevitElementId: " +
+                    (revitElementId?.ToString() ?? "null") +
                     " | ProjectId: " +
                     (projectId?.ToString() ?? "null"));
 
@@ -725,7 +732,35 @@ namespace RevitPlugin
                 }
 
                 // ============================================================
-                // OPEN VIEW ACTION
+                // SYNC VIEWS REQUEST
+                // ============================================================
+
+                if (
+                    string.Equals(
+                        action,
+                        "sync",
+                        StringComparison.OrdinalIgnoreCase)
+                    ||
+                    string.Equals(
+                        action,
+                        "sync_views",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    string syncResponse =
+                        SyncProjectViews(app);
+
+                    lock (requestLock)
+                    {
+                        pendingResponse = syncResponse;
+                    }
+
+                    SignalCompletion();
+
+                    return;
+                }
+
+                // ============================================================
+                // OPEN VIEW / SELECT / HIGHLIGHT / ZOOM ACTIONS
                 // ============================================================
 
                 if (
@@ -775,6 +810,27 @@ namespace RevitPlugin
                         return;
                     }
                 }
+                else if (
+                    string.Equals(action, "select", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(action, "highlight", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(action, "zoom", StringComparison.OrdinalIgnoreCase))
+                {
+                    string elemResponse =
+                        SelectOrZoomElement(
+                            app,
+                            action,
+                            revitElementId ?? revitViewId,
+                            projectId);
+
+                    lock (requestLock)
+                    {
+                        pendingResponse = elemResponse;
+                    }
+
+                    SignalCompletion();
+
+                    return;
+                }
                 else
                 {
                     string errResp =
@@ -788,12 +844,7 @@ namespace RevitPlugin
 
                     SignalCompletion();
 
-                    RevitAIApp.Log("Unsupported action: " + action);
-
-                    TaskDialog.Show(
-                        "RevitAI",
-                        "Unsupported action:\n\n" +
-                        action);
+                    RevitAIApp.Log("[Action] Unsupported action: " + action);
 
                     return;
                 }
@@ -886,8 +937,39 @@ namespace RevitPlugin
                         projectName,
                         normalizedPath);
 
+                bool isSynced = false;
+
+                if (projectId.HasValue)
+                {
+                    isSynced = IsProjectSyncedInDatabase(projectId.Value);
+                }
+
+                // ============================================================
+                // AUTOMATIC PROJECT SYNCHRONIZATION REQUIREMENT
+                // If project is not in database or has no views synchronized,
+                // automatically synchronize its Revit data now.
+                // ============================================================
+                if (!projectId.HasValue || !isSynced)
+                {
+                    RevitAIApp.Log(
+                        "Active document '" + projectName + "' is not synchronized. " +
+                        "Performing automatic project synchronization...");
+
+                    SyncProjectViews(app);
+
+                    projectId =
+                        FindProjectId(
+                            projectName,
+                            normalizedPath);
+
+                    if (projectId.HasValue)
+                    {
+                        isSynced = IsProjectSyncedInDatabase(projectId.Value);
+                    }
+                }
+
                 string projectIdJson =
-                    projectId.HasValue
+                    (projectId.HasValue && isSynced)
                         ? projectId.Value.ToString()
                         : "null";
 
@@ -899,15 +981,15 @@ namespace RevitPlugin
                           "\"";
 
                 string message =
-                    projectId.HasValue
+                    (projectId.HasValue && isSynced)
                         ? "Active Revit project found."
-                        : "Active Revit project is not synchronized yet. Click Sync Views first.";
+                        : "Active Revit project is not synchronized yet.";
 
                 return
                     "{"
                     + "\"success\":true,"
                     + "\"synced\":" +
-                    (projectId.HasValue ? "true" : "false") +
+                    (isSynced ? "true" : "false") +
                     ","
                     + "\"project_id\":" +
                     projectIdJson +
@@ -931,12 +1013,464 @@ namespace RevitPlugin
 
                 return
                     "{"
-                    + "\"success\":false,"
-                    + "\"message\":\"" +
+                    + "\"success\":false,\"message\":\"" +
                     RevitAIApp.JsonEscape(
                         ex.Message) +
                     "\""
                     + "}";
+            }
+        }
+
+        public static bool IsProjectSyncedInDatabase(
+            int projectId)
+        {
+            try
+            {
+                using (
+                    NpgsqlConnection connection =
+                        new NpgsqlConnection(
+                            PostgreSQLConfig.ConnectionString))
+                {
+                    connection.Open();
+                    using (
+                        NpgsqlCommand command =
+                            new NpgsqlCommand(
+                                @"SELECT COUNT(*)
+                                  FROM revit_views
+                                  WHERE project_id = @project_id;",
+                                connection))
+                    {
+                        command.Parameters.AddWithValue(
+                            "project_id",
+                            projectId);
+
+                        object result = command.ExecuteScalar();
+                        if (result != null && result != DBNull.Value)
+                        {
+                            long count = Convert.ToInt64(result);
+                            return count > 0;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                RevitAIApp.Log("IsProjectSyncedInDatabase ERROR: " + ex);
+            }
+            return false;
+        }
+
+        public static string SyncProjectViews(
+            UIApplication app)
+        {
+            try
+            {
+                RevitAIApp.Log("========================================");
+                RevitAIApp.Log("SyncProjectViews started");
+
+                UIDocument uidoc = app.ActiveUIDocument;
+
+                if (uidoc == null)
+                {
+                    return "{\"success\":false,\"message\":\"No active Revit document was found.\"}";
+                }
+
+                Document doc = uidoc.Document;
+
+                if (doc == null)
+                {
+                    return "{\"success\":false,\"message\":\"No active Revit document was found.\"}";
+                }
+
+                string projectName = doc.Title;
+                string rawFilePath = doc.PathName;
+                string normalizedPath = RevitAIApp.NormalizeFilePath(rawFilePath);
+
+                RevitAIApp.Log("Syncing document: " + projectName);
+                RevitAIApp.Log("Normalized path: " + (normalizedPath ?? "[UNSAVED PROJECT]"));
+
+                FilteredElementCollector collector =
+                    new FilteredElementCollector(doc).OfClass(typeof(View));
+
+                int viewCount = 0;
+                int projectId = 0;
+
+                using (
+                    NpgsqlConnection connection =
+                        new NpgsqlConnection(PostgreSQLConfig.ConnectionString))
+                {
+                    connection.Open();
+
+                    using (
+                        NpgsqlTransaction transaction =
+                            connection.BeginTransaction())
+                    {
+                        try
+                        {
+                            projectId =
+                                GetOrCreateProject(
+                                    connection,
+                                    transaction,
+                                    projectName,
+                                    normalizedPath);
+
+                            RevitAIApp.Log("Project ID resolved: " + projectId);
+
+                            // ====================================================
+                            // PROJECT-SCOPED SYNCHRONIZATION:
+                            // DELETE ONLY THIS PROJECT'S EXISTING VIEWS
+                            // ====================================================
+                            using (
+                                NpgsqlCommand deleteCommand =
+                                    new NpgsqlCommand(
+                                        @"DELETE FROM revit_views
+                                          WHERE project_id = @project_id;",
+                                        connection,
+                                        transaction))
+                            {
+                                deleteCommand.Parameters.AddWithValue("project_id", projectId);
+                                int deletedRows = deleteCommand.ExecuteNonQuery();
+                                RevitAIApp.Log("Deleted old views for project " + projectId + ": " + deletedRows);
+                            }
+
+                            foreach (Element element in collector)
+                            {
+                                View view = element as View;
+                                if (view == null || view.IsTemplate)
+                                {
+                                    continue;
+                                }
+
+                                string viewType = view.ViewType.ToString();
+                                string viewName = view.Name;
+
+                                Autodesk.Revit.DB.ViewSheet sheet = view as Autodesk.Revit.DB.ViewSheet;
+                                if (sheet != null)
+                                {
+                                    viewType = "DrawingSheet";
+                                    if (!string.IsNullOrEmpty(sheet.SheetNumber) && !viewName.StartsWith(sheet.SheetNumber))
+                                    {
+                                        viewName = sheet.SheetNumber + " - " + sheet.Name;
+                                    }
+                                }
+
+                                string description = BuildViewDescription(view);
+                                string levelName = GetViewLevelName(view);
+
+                                using (
+                                    NpgsqlCommand insertCommand =
+                                        new NpgsqlCommand(
+                                            @"INSERT INTO revit_views
+                                              (revit_view_id, name, view_type, description, level_name, project_id)
+                                              VALUES
+                                              (@revit_view_id, @name, @view_type, @description, @level_name, @project_id);",
+                                            connection,
+                                            transaction))
+                                {
+                                    insertCommand.Parameters.AddWithValue("revit_view_id", view.Id.Value);
+                                    insertCommand.Parameters.AddWithValue("name", viewName);
+                                    insertCommand.Parameters.AddWithValue("view_type", viewType);
+                                    insertCommand.Parameters.AddWithValue("description", description);
+                                    insertCommand.Parameters.AddWithValue("level_name", (object)levelName ?? DBNull.Value);
+                                    insertCommand.Parameters.AddWithValue("project_id", projectId);
+
+                                    insertCommand.ExecuteNonQuery();
+                                }
+
+                                viewCount++;
+                            }
+
+                            // Optional Element Sync
+                            try
+                            {
+                                using (NpgsqlCommand createElemTableCmd = new NpgsqlCommand(
+                                    @"CREATE TABLE IF NOT EXISTS revit_elements (
+                                        id SERIAL PRIMARY KEY,
+                                        project_id INTEGER NOT NULL REFERENCES revit_projects(id) ON DELETE CASCADE,
+                                        revit_element_id BIGINT NOT NULL,
+                                        category VARCHAR(100) NOT NULL,
+                                        family_name VARCHAR(255),
+                                        type_name VARCHAR(255),
+                                        name VARCHAR(255),
+                                        level_name VARCHAR(100),
+                                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                    );", connection, transaction))
+                                {
+                                    createElemTableCmd.ExecuteNonQuery();
+                                }
+
+                                using (NpgsqlCommand deleteElemCmd = new NpgsqlCommand(
+                                    @"DELETE FROM revit_elements WHERE project_id = @project_id;", connection, transaction))
+                                {
+                                    deleteElemCmd.Parameters.AddWithValue("project_id", projectId);
+                                    deleteElemCmd.ExecuteNonQuery();
+                                }
+
+                                System.Collections.Generic.List<BuiltInCategory> categoriesToSync = new System.Collections.Generic.List<BuiltInCategory>
+                                {
+                                    BuiltInCategory.OST_Walls,
+                                    BuiltInCategory.OST_Doors,
+                                    BuiltInCategory.OST_Windows,
+                                    BuiltInCategory.OST_Rooms,
+                                    BuiltInCategory.OST_Floors,
+                                    BuiltInCategory.OST_Ceilings,
+                                    BuiltInCategory.OST_Columns,
+                                    BuiltInCategory.OST_StructuralColumns,
+                                    BuiltInCategory.OST_StructuralFraming,
+                                    BuiltInCategory.OST_StructuralFoundation
+                                };
+
+                                ElementMulticategoryFilter catFilter = new ElementMulticategoryFilter(categoriesToSync);
+                                FilteredElementCollector elemCollector = new FilteredElementCollector(doc).WherePasses(catFilter).WhereElementIsNotElementType();
+
+                                foreach (Element elem in elemCollector)
+                                {
+                                    string category = elem.Category != null ? elem.Category.Name : "Element";
+                                    string familyName = "";
+                                    string typeName = elem.Name;
+                                    ElementType elemType = doc.GetElement(elem.GetTypeId()) as ElementType;
+                                    if (elemType != null)
+                                    {
+                                        familyName = elemType.FamilyName;
+                                        typeName = elemType.Name;
+                                    }
+                                    string elemName = elem.Name;
+                                    string elemLevelName = GetViewLevelName(doc.GetElement(elem.LevelId) as View) ?? "";
+
+                                    using (NpgsqlCommand insertElemCmd = new NpgsqlCommand(
+                                        @"INSERT INTO revit_elements (revit_element_id, category, family_name, type_name, name, level_name, project_id)
+                                          VALUES (@revit_element_id, @category, @family_name, @type_name, @name, @level_name, @project_id);",
+                                        connection, transaction))
+                                    {
+                                        insertElemCmd.Parameters.AddWithValue("revit_element_id", elem.Id.Value);
+                                        insertElemCmd.Parameters.AddWithValue("category", category);
+                                        insertElemCmd.Parameters.AddWithValue("family_name", (object)familyName ?? DBNull.Value);
+                                        insertElemCmd.Parameters.AddWithValue("type_name", (object)typeName ?? DBNull.Value);
+                                        insertElemCmd.Parameters.AddWithValue("name", (object)elemName ?? DBNull.Value);
+                                        insertElemCmd.Parameters.AddWithValue("level_name", (object)elemLevelName ?? DBNull.Value);
+                                        insertElemCmd.Parameters.AddWithValue("project_id", projectId);
+                                        insertElemCmd.ExecuteNonQuery();
+                                    }
+                                }
+                            }
+                            catch (Exception elemEx)
+                            {
+                                RevitAIApp.Log("Element sync warning: " + elemEx.Message);
+                            }
+
+                            transaction.Commit();
+                            RevitAIApp.Log("PostgreSQL transaction committed");
+                        }
+                        catch
+                        {
+                            transaction.Rollback();
+                            RevitAIApp.Log("PostgreSQL transaction rolled back");
+                            throw;
+                        }
+                    }
+
+                    connection.Close();
+                }
+
+                RevitAIApp.Log("Total views synchronized: " + viewCount);
+
+                return
+                    "{"
+                    + "\"success\":true,"
+                    + "\"project_id\":" + projectId + ","
+                    + "\"project_name\":\"" + RevitAIApp.JsonEscape(projectName) + "\","
+                    + "\"views_count\":" + viewCount + ","
+                    + "\"message\":\"Project synchronization completed successfully.\""
+                    + "}";
+            }
+            catch (Exception ex)
+            {
+                RevitAIApp.Log("SyncProjectViews ERROR: " + ex);
+                return "{\"success\":false,\"message\":\"Sync failed: " + RevitAIApp.JsonEscape(ex.Message) + "\"}";
+            }
+        }
+
+        public static int GetOrCreateProject(
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction,
+            string projectName,
+            string normalizedFilePath)
+        {
+            int? existingId = FindProjectId(projectName, normalizedFilePath);
+            if (existingId.HasValue)
+            {
+                return existingId.Value;
+            }
+
+            using (
+                NpgsqlCommand command =
+                    new NpgsqlCommand(
+                        @"INSERT INTO revit_projects (project_name, file_path)
+                          VALUES (@project_name, @file_path)
+                          RETURNING id;",
+                        connection,
+                        transaction))
+            {
+                command.Parameters.AddWithValue("project_name", projectName);
+                command.Parameters.AddWithValue("file_path", (object)normalizedFilePath ?? DBNull.Value);
+
+                object result = command.ExecuteScalar();
+                if (result != null && result != DBNull.Value)
+                {
+                    return Convert.ToInt32(result);
+                }
+            }
+
+            throw new Exception("Failed to get or create project in database.");
+        }
+
+        public static string BuildViewDescription(View view)
+        {
+            try
+            {
+                string type =
+                    view.ViewType.ToString();
+
+                string levelName =
+                    GetViewLevelName(view);
+
+                if (
+                    string.Equals(
+                        type,
+                        "FloorPlan",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!string.IsNullOrWhiteSpace(levelName))
+                    {
+                        return
+                            "Floor plan view: " +
+                            view.Name +
+                            ". Level: " +
+                            levelName +
+                            ". Floor plan for level " +
+                            levelName + ".";
+                    }
+
+                    return
+                        "Floor plan view: " +
+                        view.Name;
+                }
+
+                if (
+                    string.Equals(
+                        type,
+                        "CeilingPlan",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!string.IsNullOrWhiteSpace(levelName))
+                    {
+                        return
+                            "Ceiling plan view: " +
+                            view.Name +
+                            ". Level: " +
+                            levelName +
+                            ". Ceiling plan for level " +
+                            levelName + ".";
+                    }
+
+                    return
+                        "Ceiling plan view: " +
+                        view.Name;
+                }
+
+                if (
+                    string.Equals(
+                        type,
+                        "Elevation",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return
+                        "Elevation view: " +
+                        view.Name;
+                }
+
+                if (
+                    string.Equals(
+                        type,
+                        "Section",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return
+                        "Section view: " +
+                        view.Name;
+                }
+
+                if (
+                    string.Equals(
+                        type,
+                        "ThreeD",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return
+                        "3D view: " +
+                        view.Name;
+                }
+
+                if (
+                    string.Equals(
+                        type,
+                        "DraftingView",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return
+                        "Drafting view: " +
+                        view.Name;
+                }
+
+                if (
+                    string.Equals(
+                        type,
+                        "Schedule",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return
+                        "Schedule view: " +
+                        view.Name;
+                }
+
+                if (
+                    string.Equals(
+                        type,
+                        "DrawingSheet",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return
+                        "Drawing sheet: " +
+                        view.Name;
+                }
+
+                return
+                    type +
+                    " view: " +
+                    view.Name;
+            }
+            catch
+            {
+                return
+                    "Revit view: " +
+                    view.Name;
+            }
+        }
+
+        public static string GetViewLevelName(View view)
+        {
+            try
+            {
+                ViewPlan viewPlan = view as ViewPlan;
+                if (viewPlan != null && viewPlan.GenLevel != null)
+                {
+                    return viewPlan.GenLevel.Name;
+                }
+                return null;
+            }
+            catch
+            {
+                return null;
             }
         }
 
@@ -1083,6 +1617,84 @@ namespace RevitPlugin
             }
 
             return false;
+        }
+
+        private string SelectOrZoomElement(
+            UIApplication app,
+            string actionName,
+            long? elementIdVal,
+            int? targetProjectId)
+        {
+            try
+            {
+                string normAction = actionName?.Trim().ToUpperInvariant() ?? "SELECT";
+                RevitAIApp.Log(
+                    "[Action] Received: action=" + normAction +
+                    " project_id=" + (targetProjectId?.ToString() ?? "null") +
+                    " revit_element_id=" + (elementIdVal?.ToString() ?? "null"));
+
+                UIDocument uidoc = app.ActiveUIDocument;
+                if (uidoc == null || uidoc.Document == null)
+                {
+                    RevitAIApp.Log("[Action] Error: NO_ACTIVE_DOCUMENT");
+                    return "{\"success\":false,\"message\":\"No active Revit document was found.\",\"error_code\":\"NO_ACTIVE_DOCUMENT\"}";
+                }
+
+                Document doc = uidoc.Document;
+                int? activeProjectId = FindProjectId(doc.Title, RevitAIApp.NormalizeFilePath(doc.PathName));
+                RevitAIApp.Log("[Action] Active Project: project_id=" + (activeProjectId?.ToString() ?? "null") + " project_name=" + doc.Title);
+
+                // Project Safety Validation
+                if (targetProjectId.HasValue)
+                {
+                    if (!activeProjectId.HasValue || activeProjectId.Value != targetProjectId.Value)
+                    {
+                        RevitAIApp.Log(
+                            "[Action] PROJECT_MISMATCH requested_project_id=" + targetProjectId.Value +
+                            " active_project_id=" + (activeProjectId?.ToString() ?? "none"));
+                        return "{\"success\":false,\"message\":\"The requested element belongs to another Revit project.\",\"error_code\":\"PROJECT_MISMATCH\"}";
+                    }
+                }
+
+                if (!elementIdVal.HasValue || elementIdVal.Value <= 0)
+                {
+                    RevitAIApp.Log("[Action] Error: INVALID_ELEMENT_ID");
+                    return "{\"success\":false,\"message\":\"Invalid Revit element ID provided.\",\"error_code\":\"INVALID_ELEMENT_ID\"}";
+                }
+
+                ElementId elemId = new ElementId(elementIdVal.Value);
+                Element elem = doc.GetElement(elemId);
+
+                if (elem == null)
+                {
+                    RevitAIApp.Log("[Action] Error: ELEMENT_NOT_FOUND");
+                    return "{\"success\":false,\"message\":\"Element was not found in the active project.\",\"error_code\":\"ELEMENT_NOT_FOUND\"}";
+                }
+
+                // Selection & Zoom
+                uidoc.Selection.SetElementIds(new System.Collections.Generic.List<ElementId> { elemId });
+
+                if (string.Equals(normAction, "ZOOM", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(normAction, "HIGHLIGHT", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        uidoc.ShowElements(elemId);
+                    }
+                    catch (Exception zoomEx)
+                    {
+                        RevitAIApp.Log("[Action] ShowElements warning: " + zoomEx.Message);
+                    }
+                }
+
+                RevitAIApp.Log("[Action] Result: SUCCESS");
+                return "{\"success\":true,\"message\":\"Successfully executed " + normAction + " on element ID " + elementIdVal.Value + " (" + RevitAIApp.JsonEscape(elem.Name) + ").\"}";
+            }
+            catch (Exception ex)
+            {
+                RevitAIApp.Log("SelectOrZoomElement ERROR: " + ex);
+                return "{\"success\":false,\"message\":\"Element action failed: " + RevitAIApp.JsonEscape(ex.Message) + "\",\"error_code\":\"ELEMENT_ACTION_ERROR\"}";
+            }
         }
 
         private string OpenView(
@@ -1708,7 +2320,7 @@ namespace RevitPlugin
                             // ====================================================
 
                             projectId =
-                                GetOrCreateProject(
+                                RevitAIExternalEventHandler.GetOrCreateProject(
                                     connection,
                                     transaction,
                                     projectName,
@@ -1770,7 +2382,7 @@ namespace RevitPlugin
                                     view.ViewType.ToString();
 
                                 string description =
-                                    BuildViewDescription(
+                                    RevitAIExternalEventHandler.BuildViewDescription(
                                         view);
 
                                 using (
@@ -1814,7 +2426,7 @@ namespace RevitPlugin
                                         description);
 
                                     string levelName =
-                                        GetViewLevelName(view);
+                                        RevitAIExternalEventHandler.GetViewLevelName(view);
 
                                     if (string.IsNullOrWhiteSpace(levelName))
                                     {
@@ -1911,397 +2523,6 @@ namespace RevitPlugin
                     ex.Message;
 
                 return Result.Failed;
-            }
-        }
-
-        // ============================================================
-        // Find existing project or create a new project
-        // ============================================================
-
-        private int GetOrCreateProject(
-            NpgsqlConnection connection,
-            NpgsqlTransaction transaction,
-            string projectName,
-            string normalizedFilePath)
-        {
-            RevitAIApp.Log(
-                "Searching for existing project");
-
-            int? existingProjectId = null;
-
-            // ------------------------------------------------------------
-            // 1. Saved Revit document: Match by normalized file_path
-            // ------------------------------------------------------------
-            if (!string.IsNullOrWhiteSpace(normalizedFilePath))
-            {
-                using (
-                    NpgsqlCommand findCommand =
-                        new NpgsqlCommand(
-                            @"SELECT id
-                              FROM revit_projects
-                              WHERE file_path IS NOT NULL
-                                AND (file_path = @file_path OR LOWER(REPLACE(file_path, '/', '\')) = @file_path)
-                              ORDER BY id
-                              LIMIT 1;",
-                            connection,
-                            transaction))
-                {
-                    findCommand.Parameters.AddWithValue(
-                        "file_path",
-                        normalizedFilePath);
-
-                    object result =
-                        findCommand.ExecuteScalar();
-
-                    if (
-                        result != null &&
-                        result != DBNull.Value)
-                    {
-                        existingProjectId =
-                            Convert.ToInt32(result);
-                    }
-                }
-
-                // If not found by file path, check if there's a previously unsaved record with matching project_name
-                if (!existingProjectId.HasValue)
-                {
-                    using (
-                        NpgsqlCommand findUnsavedCommand =
-                            new NpgsqlCommand(
-                                @"SELECT id
-                                  FROM revit_projects
-                                  WHERE project_name = @project_name
-                                    AND file_path IS NULL
-                                  ORDER BY id
-                                  LIMIT 1;",
-                                connection,
-                                transaction))
-                    {
-                        findUnsavedCommand.Parameters.AddWithValue(
-                            "project_name",
-                            projectName);
-
-                        object result =
-                            findUnsavedCommand.ExecuteScalar();
-
-                        if (
-                            result != null &&
-                            result != DBNull.Value)
-                        {
-                            existingProjectId =
-                                Convert.ToInt32(result);
-                        }
-                    }
-                }
-            }
-            // ------------------------------------------------------------
-            // 2. Unsaved Revit project: Fall back to project_name
-            // ------------------------------------------------------------
-            else
-            {
-                using (
-                    NpgsqlCommand findCommand =
-                        new NpgsqlCommand(
-                            @"SELECT id
-                              FROM revit_projects
-                              WHERE project_name = @project_name
-                                AND file_path IS NULL
-                              ORDER BY id
-                              LIMIT 1;",
-                            connection,
-                            transaction))
-                {
-                    findCommand.Parameters.AddWithValue(
-                        "project_name",
-                        projectName);
-
-                    object result =
-                        findCommand.ExecuteScalar();
-
-                    if (
-                        result != null &&
-                        result != DBNull.Value)
-                    {
-                        existingProjectId =
-                            Convert.ToInt32(result);
-                    }
-                }
-            }
-
-            // ------------------------------------------------------------
-            // Existing project found -> Update details
-            // ------------------------------------------------------------
-            if (existingProjectId.HasValue)
-            {
-                int id =
-                    existingProjectId.Value;
-
-                RevitAIApp.Log(
-                    "Existing project found | Project ID: " +
-                    id);
-
-                using (
-                    NpgsqlCommand updateCommand =
-                        new NpgsqlCommand(
-                            @"UPDATE revit_projects
-                              SET project_name = @project_name,
-                                  file_path = @file_path,
-                                  updated_at = CURRENT_TIMESTAMP
-                              WHERE id = @id;",
-                            connection,
-                            transaction))
-                {
-                    updateCommand.Parameters.AddWithValue(
-                        "project_name",
-                        projectName);
-
-                    if (string.IsNullOrWhiteSpace(normalizedFilePath))
-                    {
-                        updateCommand.Parameters.AddWithValue(
-                            "file_path",
-                            DBNull.Value);
-                    }
-                    else
-                    {
-                        updateCommand.Parameters.AddWithValue(
-                            "file_path",
-                            normalizedFilePath);
-                    }
-
-                    updateCommand.Parameters.AddWithValue(
-                        "id",
-                        id);
-
-                    updateCommand.ExecuteNonQuery();
-                }
-
-                RevitAIApp.Log(
-                    "Existing project updated | Project ID: " +
-                    id);
-
-                return id;
-            }
-
-            // ------------------------------------------------------------
-            // Project does not exist -> Create new project
-            // ------------------------------------------------------------
-            RevitAIApp.Log(
-                "Project not found. Creating new project.");
-
-            using (
-                NpgsqlCommand insertProjectCommand =
-                    new NpgsqlCommand(
-                        @"INSERT INTO revit_projects
-                          (
-                              project_name,
-                              file_path
-                          )
-                          VALUES
-                          (
-                              @project_name,
-                              @file_path
-                          )
-                          RETURNING id;",
-                        connection,
-                        transaction))
-            {
-                insertProjectCommand.Parameters.AddWithValue(
-                    "project_name",
-                    projectName);
-
-                if (string.IsNullOrWhiteSpace(normalizedFilePath))
-                {
-                    insertProjectCommand.Parameters.AddWithValue(
-                        "file_path",
-                        DBNull.Value);
-                }
-                else
-                {
-                    insertProjectCommand.Parameters.AddWithValue(
-                        "file_path",
-                        normalizedFilePath);
-                }
-
-                int newProjectId =
-                    Convert.ToInt32(
-                        insertProjectCommand.ExecuteScalar());
-
-                RevitAIApp.Log(
-                    "New project created | Project ID: " +
-                    newProjectId);
-
-                return newProjectId;
-            }
-        }
-
-        // ============================================================
-        // Build view description
-        // ============================================================
-
-        private string BuildViewDescription(
-            View view)
-        {
-            try
-            {
-                string type =
-                    view.ViewType.ToString();
-
-                string levelName =
-                    GetViewLevelName(view);
-
-                if (
-                    string.Equals(
-                        type,
-                        "FloorPlan",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    if (!string.IsNullOrWhiteSpace(levelName))
-                    {
-                        return
-                            "Floor plan view: " +
-                            view.Name +
-                            ". Level: " +
-                            levelName +
-                            ". Floor plan for level " +
-                            levelName + ".";
-                    }
-
-                    return
-                        "Floor plan view: " +
-                        view.Name;
-                }
-
-                if (
-                    string.Equals(
-                        type,
-                        "CeilingPlan",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    if (!string.IsNullOrWhiteSpace(levelName))
-                    {
-                        return
-                            "Ceiling plan view: " +
-                            view.Name +
-                            ". Level: " +
-                            levelName +
-                            ". Ceiling plan for level " +
-                            levelName + ".";
-                    }
-
-                    return
-                        "Ceiling plan view: " +
-                        view.Name;
-                }
-
-                if (
-                    string.Equals(
-                        type,
-                        "Elevation",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    return
-                        "Elevation view: " +
-                        view.Name;
-                }
-
-                if (
-                    string.Equals(
-                        type,
-                        "Section",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    return
-                        "Section view: " +
-                        view.Name;
-                }
-
-                if (
-                    string.Equals(
-                        type,
-                        "ThreeD",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    return
-                        "3D view: " +
-                        view.Name;
-                }
-
-                if (
-                    string.Equals(
-                        type,
-                        "DraftingView",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    return
-                        "Drafting view: " +
-                        view.Name;
-                }
-
-                if (
-                    string.Equals(
-                        type,
-                        "Schedule",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    return
-                        "Schedule view: " +
-                        view.Name;
-                }
-
-                if (
-                    string.Equals(
-                        type,
-                        "DrawingSheet",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    return
-                        "Drawing sheet: " +
-                        view.Name;
-                }
-
-                return
-                    type +
-                    " view: " +
-                    view.Name;
-            }
-            catch
-            {
-                return
-                    "Revit view: " +
-                    view.Name;
-            }
-        }
-
-        // ============================================================
-        // Get the Revit level associated with a plan view
-        // ============================================================
-
-        private string GetViewLevelName(
-            View view)
-        {
-            try
-            {
-                ViewPlan viewPlan =
-                    view as ViewPlan;
-
-                if (viewPlan == null)
-                {
-                    return null;
-                }
-
-                Level level =
-                    viewPlan.GenLevel;
-
-                if (level == null)
-                {
-                    return null;
-                }
-
-                return level.Name;
-            }
-            catch
-            {
-                return null;
             }
         }
 

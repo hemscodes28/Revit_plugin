@@ -3,11 +3,11 @@
   "version": "1.0.0",
   "description": "",
   "main": "./out/main/index.js",
- "scripts": {
-  "dev": "electron-vite dev",
-  "build": "electron-vite build",
-  "start": "electron-vite preview"
-},
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -23,6 +23,7 @@
     "vite": "^7.3.6"
   },
   "dependencies": {
+    "lucide-react": "^1.47.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   }
