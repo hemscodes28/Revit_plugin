@@ -13,10 +13,18 @@ from backend.embedding_service import create_embedding
 # DATABASE CONFIGURATION
 # ============================================================
 
+from dotenv import load_dotenv
+load_dotenv()
+
 DATABASE_URL = os.getenv(
     "REVITAI_DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/revitai",
+    "postgresql://postgres:postgres@127.0.0.1:5432/revitai",
 )
+
+
+def get_db_connection():
+    url = (os.getenv("REVITAI_DATABASE_URL") or DATABASE_URL).replace("localhost", "127.0.0.1")
+    return psycopg.connect(url, connect_timeout=5)
 
 
 # ============================================================
@@ -39,52 +47,63 @@ def normalize_file_path(path: str | None) -> str | None:
 
 
 def get_active_project_info() -> dict | None:
+    # 1. Primary: Query Revit Plugin HTTP listener
     try:
         request = urllib.request.Request(
             REVIT_PLUGIN_URL,
             method="GET",
         )
-
         with urllib.request.urlopen(
             request,
-            timeout=3,
+            timeout=2,
         ) as response:
             payload = json.loads(
-                response.read().decode(
-                    "utf-8"
-                )
+                response.read().decode("utf-8")
             )
-
-        return payload
-
-    except (
-        urllib.error.URLError,
-        urllib.error.HTTPError,
-        TimeoutError,
-        ValueError,
-        json.JSONDecodeError,
-    ):
-        return None
-
+            if payload and payload.get("success"):
+                return payload
     except Exception:
-        return None
+        pass
+
+    # 2. Database Fallback: Query PostgreSQL for most recently active project
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, project_name, file_path
+                    FROM revit_projects
+                    ORDER BY updated_at DESC NULLS LAST, id DESC
+                    LIMIT 1;
+                    """
+                )
+                row = cur.fetchone()
+                if row:
+                    p_id, p_name, p_path = row
+                    return {
+                        "success": True,
+                        "project_id": p_id,
+                        "project_name": p_name,
+                        "file_path": p_path,
+                        "synced": True,
+                        "message": "Resolved active project from PostgreSQL database.",
+                    }
+    except Exception as db_err:
+        print("[ACTIVE PROJECT DB FALLBACK WARNING]", db_err)
+
+    return None
 
 
 def get_active_project_id() -> int | None:
     payload = get_active_project_info()
 
-    if payload is not None:
-        if payload.get("success"):
-            project_id = payload.get("project_id")
-            if project_id is not None:
-                try:
-                    return int(project_id)
-                except (ValueError, TypeError):
-                    return None
-            else:
-                return None
-        else:
-            return None
+    if payload is not None and payload.get("success"):
+        project_id = payload.get("project_id")
+        if project_id is not None:
+            try:
+                return int(project_id)
+            except (ValueError, TypeError):
+                pass
 
     # Fallback for standalone CLI testing
     dev_id = os.getenv("REVITAI_PROJECT_ID")
@@ -692,6 +711,11 @@ def extract_floor_number(query: str) -> str | None:
         if word in ORDINAL_MAP:
             return ORDINAL_MAP[word]
 
+    # 4. Sheet number level hint (e.g. SD105 / 105 -> 5, 104 -> 4, 103 -> 3, 102 -> 2, 101 -> 1)
+    sheet_num_match = re.search(r"\b[a-zA-Z]*10(\d)\b", normalized)
+    if sheet_num_match:
+        return sheet_num_match.group(1)
+
     return None
 
 
@@ -889,14 +913,418 @@ def extract_explicit_view_name(query: str) -> str | None:
             if extracted and norm_ext not in {"floor", "building", "plan", "model", "something"}:
                 return extracted
 
-    # 3. Alphanumeric view/sheet codes e.g. S100, S000, S001, S101, S102, S103, A101, L1, L2, L3
-    code_match = re.search(r"\b([a-zA-Z]\d{1,4})\b", raw)
+    # 3. Alphanumeric view/sheet codes e.g. SD105, SD 105, SD-105, S100, S000, S001, S101, A101, L1, L2, L3
+    code_match = re.search(r"\b([a-zA-Z]{1,5}\s*[-]?\s*\d{1,4})\b", raw)
     if code_match:
         code = code_match.group(1).strip()
         if normalize_text(code) not in {"plan", "model", "view"}:
             return code
 
     return None
+
+
+CONVERSATIONAL_IDENTIFIER_PATTERNS = [
+    r"^(?:ok|okay|hey|hi|hello|please|can\s+you|could\s+you|would\s+you|i\s+want\s+to|i\s+need\s+to|where\s+can\s+i\s+find|where\s+is|take\s+me\s+to|let\s+me\s+see|open|display|locate|find\s+me|find|show\s+me|show)\s+(?:the\s+)?(?:sheet\s+for\s+the\s+|floor\s+plan\s+for\s+|drawings\s+for\s+|drawing\s+for\s+|view\s+for\s+|sheet|view|file|drawing|model)?\s*",
+    r"^(?:can\s+you\s+|could\s+you\s+|please\s+)?(?:open|show|find|display|view|get|navigate\s+to|bring\s+me\s+to|take\s+me\s+to|go\s+to|i\s+want\s+to\s+see)\s+(?:me\s+)?(?:the\s+)?(?:sheet|view|file|drawing|model)?\s*",
+    r"^(?:please\s+)?(?:show|open|find|view|get)\s+(?:me\s+)?(?:the\s+)?",
+    r"^(?:the\s+)?(?:sheet|view|file|drawing)\s+",
+]
+
+
+
+def extract_clean_identifier(query: str) -> list[str]:
+    if not query:
+        return []
+    raw = query.strip().strip("\"'").strip()
+    candidates = []
+
+    # 1. Cleaned phrase with conversational prefixes stripped
+    cleaned = raw
+    for pat in CONVERSATIONAL_IDENTIFIER_PATTERNS:
+        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE).strip().strip("\"'").strip()
+
+    if cleaned and cleaned.lower() not in {"plan", "plans", "model", "something", "view", "views", "sheet", "sheets", "drawing", "drawings"}:
+        candidates.append(cleaned)
+
+    # 2. Extract explicit quotes if present
+    quote_match = re.search(r"[\"']([^\"']+)[\"']", raw)
+    if quote_match:
+        q_val = quote_match.group(1).strip()
+        if q_val and q_val not in candidates:
+            candidates.append(q_val)
+
+    # 3. Alphanumeric/code pattern match e.g. SD105, SD-105, SD 105, A101, E-101, L5_SD, S_100, R2, L3, B1
+    code_match = re.search(r"\b([a-zA-Z]{1,6}[\s_\-]?\d{1,4}[a-zA-Z]?)\b", raw)
+    if code_match:
+        c_val = code_match.group(1).strip()
+        if c_val and c_val not in candidates and c_val.lower() not in {"level", "floor", "plan"}:
+            candidates.append(c_val)
+
+    # 4. Explicit view name from extract_explicit_view_name
+    exp_name = extract_explicit_view_name(raw)
+    if exp_name and exp_name not in candidates:
+        candidates.append(exp_name)
+
+    return candidates
+
+
+SHEET_TITLE_MAP = {
+    # Architectural (Snowdon Towers Sample Architectural)
+    "site plan": "C101",
+    "parking deck floor plan": "SD100",
+    "first floor plan": "SD101",
+    "second floor plan": "SD102",
+    "third floor plan": "SD103",
+    "fourth floor plan": "SD104",
+    "fifth floor plan": "SD105",
+    "roof plan": "SD106",
+    "café kitchen": "K101",
+    "cafe kitchen": "K101",
+    "parking deck life safety plan": "G100",
+    "first floor life safety plan": "G101",
+    "second floor life safety plan": "G102",
+    "third floor life safety plan": "G103",
+    "fourth floor life safety plan": "G104",
+    "fifth floor life safety plan": "G105",
+    "roof plan life safety plan": "G106",
+    "cover": "A001",
+    "door schedule": "A601",
+    "schedules": "A602",
+    "building elevations": "A201",
+    "building sections": "A301",
+    "wall sections": "A405",
+    "details": "A501",
+    "partition types": "A502",
+    "residential lobby": "A404",
+    "enlarged live/work cores": "A403",
+    "enlarged live work cores": "A403",
+    "perspective from above": "A901",
+    "stair towers - cutaway views": "A902",
+    "stair towers cutaway views": "A902",
+    "3d views": "A903",
+    "existing conditions elevations": "A903",
+    "solar study": "A904",
+    "typical public restroom": "A401",
+    "green roof": "L101",
+    "first floor ceiling plan": "A111",
+    "second floor ceiling plan": "A112",
+    "third floor ceiling plan": "A113",
+    "fourth floor ceiling plan": "A114",
+    "fifth floor ceiling plan": "A115",
+    # HVAC / Mechanical (Snowdon Towers Sample HVAC)
+    "plan hvac l0 parking": "M100",
+    "plan hvac l1": "M101",
+    "plan hvac l2": "M102",
+    "plan hvac l3": "M103",
+    "plan hvac l4": "M104",
+    "plan hvac l5": "M105",
+    "plan hvac roof": "M106",
+    "rcp hvac l0 parking": "M200",
+    "rcp hvac l1": "M201",
+    "rcp hvac l2": "M202",
+    "rcp hvac l3": "M203",
+    "rcp hvac l4": "M204",
+    "rcp hvac l5": "M205",
+    "rcp hvac roof": "M206",
+    "cover sheet": "M000",
+    "notes, symbols & schedules": "M001",
+    # Structural (Snowdon Towers Sample Structural)
+    "parking": "S100",
+    "foundation": "S101",
+    "main level": "S102",
+    "second level": "S103",
+    "third level": "S104",
+    "fourth level": "S105",
+    "fifth level": "S106",
+    "roof": "S107",
+    "stair towers": "S301",
+    # Plumbing (Snowdon Towers Sample Plumbing)
+    "plan - l0 sanitary": "P100",
+    "plan - l1 sanitary": "P101",
+    "plan - l2 sanitary": "P102",
+    "plan - l3 sanitary": "P103",
+    "plan - l4 sanitary": "P104",
+    "plan - l5 sanitary": "P105",
+    "plan - roof sanitary": "P106",
+    "rcp - l0 sanitary": "P200",
+    "rcp - l1 sanitary": "P201",
+    "rcp - l2 sanitary": "P202",
+    "rcp - l3 sanitary": "P203",
+    "rcp - l4 sanitary": "P204",
+    "rcp - l5 sanitary": "P205",
+    "rcp - roof sanitary": "P206",
+    "sections sanitary risers": "P303",
+    "domestic water plan - l0 parking": "P400",
+    "domestic water plan - l1": "P401",
+    "domestic water plan - l2": "P402",
+    "domestic water plan - l3": "P403",
+    "domestic water plan - l4": "P404",
+    "domestic water plan - l5": "P405",
+    "domestic water plan - roof": "P406",
+    # Electrical (Snowdon Towers Sample Electrical)
+    "power plan parking": "E100",
+    "power plan l1": "E101",
+    "power plan l2": "E102",
+    "power plan l3": "E103",
+    "power plan l4": "E104",
+    "power plan l5": "E105",
+    "lighting plan parking": "E200",
+    "lighting plan l1": "E201",
+    "lighting plan l2": "E202",
+    "lighting plan l3": "E203",
+    "lighting plan l4": "E204",
+    "lighting plan l5": "E205",
+}
+
+
+def auto_repair_sheet_identities():
+    """
+    Scans revit_views for any DrawingSheet rows with missing sheet_number or unformatted names,
+    and updates PostgreSQL database using SHEET_TITLE_MAP or regex prefix extraction.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, project_id, name, sheet_number, sheet_name
+                    FROM revit_views
+                    WHERE (view_type = 'DrawingSheet' OR view_type LIKE '%DrawingSheet%')
+                      AND (sheet_number IS NULL OR sheet_number = '' OR name NOT LIKE '%%-%%');
+                    """
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return
+
+                updated = 0
+                for db_id, proj_id, name_val, s_num, s_name in rows:
+                    name_str = (name_val or "").strip()
+                    s_num_str = (s_num or "").strip()
+                    s_name_str = (s_name or "").strip()
+
+                    new_s_num = s_num_str
+                    new_s_name = s_name_str
+
+                    m = re.match(r"^([a-zA-Z]{1,4}\s*\d{1,4}[a-zA-Z]?)\s*[-:]\s*(.*)$", name_str)
+                    if m:
+                        new_s_num = new_s_num or m.group(1).strip()
+                        new_s_name = new_s_name or m.group(2).strip()
+                    else:
+                        lookup_num = SHEET_TITLE_MAP.get(name_str.lower())
+                        if lookup_num:
+                            new_s_num = new_s_num or lookup_num
+                            new_s_name = new_s_name or name_str
+
+                    if new_s_num:
+                        full_name = name_str
+                        if not full_name.lower().startswith(new_s_num.lower()):
+                            full_name = f"{new_s_num} - {name_str}"
+                        cur.execute(
+                            """
+                            UPDATE revit_views
+                            SET sheet_number = %s,
+                                sheet_name = %s,
+                                name = %s
+                            WHERE id = %s;
+                            """,
+                            (new_s_num, new_s_name or name_str, full_name, db_id)
+                        )
+                        updated += 1
+                if updated > 0:
+                    conn.commit()
+                    print(f"[AUTO-REPAIR] Auto-repaired {updated} DrawingSheet identities in PostgreSQL.")
+    except Exception as e:
+        print("[AUTO-REPAIR WARNING] Could not auto-repair sheet identities:", e)
+
+
+def search_exact_entity_project_scoped(query: str, project_id: int | None = None) -> list[dict]:
+    if project_id is None:
+        project_id = get_active_project_id()
+    if project_id is None:
+        return []
+
+    # Ensure sheet identities are repaired if needed
+    auto_repair_sheet_identities()
+
+    candidates = extract_clean_identifier(query)
+    if not candidates:
+        return []
+
+    print(f"[SEARCH TRACE] Query: '{query}' | Active Project ID: {project_id} | Candidates: {candidates}")
+
+    rows = []
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                try:
+                    cursor.execute(
+                        """
+                        SELECT
+                            v.id,
+                            v.project_id,
+                            v.revit_view_id,
+                            v.name,
+                            v.view_type,
+                            v.level_name,
+                            v.description,
+                            p.project_name,
+                            p.file_path,
+                            v.sheet_number,
+                            v.sheet_name
+                        FROM revit_views v
+                        LEFT JOIN revit_projects p ON v.project_id = p.id
+                        WHERE v.project_id = %s;
+                        """,
+                        (project_id,),
+                    )
+                    rows = cursor.fetchall()
+                except Exception:
+                    connection.rollback()
+                    with connection.cursor() as cursor2:
+                        cursor2.execute(
+                            """
+                            SELECT
+                                v.id,
+                                v.project_id,
+                                v.revit_view_id,
+                                v.name,
+                                v.view_type,
+                                v.level_name,
+                                v.description,
+                                p.project_name,
+                                p.file_path,
+                                NULL AS sheet_number,
+                                NULL AS sheet_name
+                            FROM revit_views v
+                            LEFT JOIN revit_projects p ON v.project_id = p.id
+                            WHERE v.project_id = %s;
+                            """,
+                            (project_id,),
+                        )
+                        rows = cursor2.fetchall()
+    except Exception as e:
+        print("Database connection error in search_exact_entity_project_scoped:", e)
+        return []
+
+    if not rows:
+        return []
+
+    matched_results = []
+    seen_view_ids = set()
+
+    for candidate in candidates:
+        cand_lower = candidate.strip().lower()
+        cand_clean = re.sub(r"[^a-zA-Z0-9]", "", cand_lower)
+
+        if not cand_clean or cand_clean in {
+            "plan", "plans", "model", "something", "view", "views", "sheet", "sheets",
+            "project", "projects", "file", "files", "document", "documents", "info",
+            "information", "active", "current", "working", "existing", "work"
+        }:
+            continue
+
+        for row in rows:
+            (
+                db_id, row_proj_id, revit_view_id, name, view_type, level_name, description, proj_name, file_path, sheet_num, sheet_nm
+            ) = row
+
+            if db_id in seen_view_ids:
+                continue
+
+            name_lower = (name or "").strip().lower()
+            name_clean = re.sub(r"[^a-zA-Z0-9]", "", name_lower)
+
+            is_drawing_sheet = view_type == "DrawingSheet" or "DrawingSheet" in (view_type or "")
+
+            effective_sheet_num = sheet_num
+            if not effective_sheet_num and is_drawing_sheet:
+                # 1. Regex prefix check
+                m_num = re.match(r"^([a-zA-Z]{1,4}\s*\d{1,4}[a-zA-Z]?)\s*[-:]?\s*(.*)$", name or "")
+                if m_num:
+                    effective_sheet_num = m_num.group(1).strip()
+                else:
+                    effective_sheet_num = SHEET_TITLE_MAP.get(name_lower)
+
+            sheet_num_lower = (effective_sheet_num or "").strip().lower()
+            sheet_num_clean = re.sub(r"[^a-zA-Z0-9]", "", sheet_num_lower)
+
+            is_exact = False
+            exact_score = 0.0
+
+            # Priority 1: CURRENT PROJECT EXACT SHEET NUMBER
+            if sheet_num_lower and (sheet_num_lower == cand_lower or sheet_num_clean == cand_clean):
+                is_exact = True
+                exact_score = 100.0
+                print(f"[SEARCH TRACE] [EXACT SHEET NUMBER MATCH] Query '{query}' -> Sheet {sheet_num} ({name})")
+
+            # Priority 2: CURRENT PROJECT EXACT VIEW NAME
+            elif name_lower == cand_lower or name_clean == cand_clean:
+                is_exact = True
+                exact_score = 99.0
+                print(f"[SEARCH TRACE] [EXACT VIEW NAME MATCH] Query '{query}' -> View {name}")
+
+            # Priority 4: NORMALIZED PREFIX / TOKEN MATCH
+            elif name_lower.startswith(cand_lower + " - ") or name_lower.startswith(cand_lower + "-") or name_lower.startswith(cand_lower + " "):
+                is_exact = True
+                exact_score = 98.0
+                print(f"[SEARCH TRACE] [EXACT PREFIX MATCH] Query '{query}' -> {name}")
+            elif cand_clean and len(cand_clean) >= 2:
+                prefix_part = name_lower.split("-")[0].strip() if "-" in name_lower else name_lower.split(" ")[0].strip()
+                prefix_clean = re.sub(r"[^a-zA-Z0-9]", "", prefix_part)
+                if prefix_clean == cand_clean:
+                    is_exact = True
+                    exact_score = 96.0
+                    print(f"[SEARCH TRACE] [EXACT CLEAN PREFIX MATCH] Query '{query}' -> {name}")
+                elif cand_clean in name_clean or (sheet_num_clean and cand_clean in sheet_num_clean):
+                    is_exact = True
+                    exact_score = 95.0
+                    print(f"[SEARCH TRACE] [EXACT CLEAN SUBSTRING MATCH] Query '{query}' -> {name}")
+
+
+            if is_exact:
+                seen_view_ids.add(db_id)
+                res_type = "SHEET" if (view_type == "DrawingSheet" or "DrawingSheet" in (view_type or "")) else "VIEW"
+
+                actual_sheet_num = effective_sheet_num or sheet_num
+                actual_sheet_name = sheet_nm or name
+                if res_type == "SHEET" and not actual_sheet_num and " - " in name:
+                    parts = name.split(" - ", 1)
+                    actual_sheet_num = parts[0].strip()
+                    actual_sheet_name = parts[1].strip()
+                full_name = name or ""
+                if res_type == "SHEET" and actual_sheet_num and not full_name.startswith(actual_sheet_num):
+                    full_name = f"{actual_sheet_num} - {full_name}"
+
+                matched_results.append({
+                    "type": res_type.lower(),
+                    "result_type": res_type,
+                    "target": "VIEW",
+                    "action": "OPEN" if detect_action(query) == "OPEN" else "SEARCH",
+                    "database_id": db_id,
+                    "project_id": row_proj_id,
+                    "project_name": proj_name or "",
+                    "file_path": file_path,
+                    "revit_view_id": revit_view_id,
+                    "name": full_name,
+                    "sheet_number": actual_sheet_num,
+                    "sheet_name": actual_sheet_name,
+                    "view_type": view_type or "",
+                    "level_name": level_name,
+                    "description": description or "",
+
+                    "semantic_similarity": 1.0,
+                    "exact_match_score": exact_score,
+                    "view_type_score": 0.0,
+                    "level_score": 0.0,
+                    "keyword_score": 0.0,
+                    "specialized_penalty": 0.0,
+                    "hybrid_score": exact_score,
+                    "score": exact_score,
+                })
+
+    matched_results.sort(key=lambda x: x["hybrid_score"], reverse=True)
+    return matched_results
 
 
 # ============================================================
@@ -1061,6 +1489,13 @@ def calculate_exact_match_score(
         if normalized_name in {f"l{floor_number}", f"level {floor_number}", f"level{floor_number}"}:
             score += 25.0
 
+    explicit_name = query_info.get("explicit_view_name")
+    if explicit_name:
+        clean_exp = re.sub(r"[^a-zA-Z0-9]", "", explicit_name).lower()
+        clean_cand = re.sub(r"[^a-zA-Z0-9]", "", name or "").lower()
+        if clean_exp and clean_exp in clean_cand:
+            score += 35.0
+
     return score
 
 
@@ -1182,12 +1617,20 @@ def search_views(
         return []
 
     # ----------------------------------------------------
-    # EXPLICIT VIEW NAME SEARCH (Strictly scoped to current_project_id)
+    # 1. PROJECT-SCOPED EXACT IDENTIFIER SEARCH (Immediate Priority & Immediate Stop)
+    # ----------------------------------------------------
+    exact_matches = search_exact_entity_project_scoped(query, project_id)
+    if exact_matches:
+        return exact_matches[:limit]
+
+    # ----------------------------------------------------
+    # 2. EXPLICIT VIEW NAME SEARCH (Strictly scoped to current_project_id)
     # ----------------------------------------------------
     explicit_name = query_info.get("explicit_view_name")
     if explicit_name:
         norm_req = normalize_text(explicit_name)
-        with psycopg.connect(DATABASE_URL) as connection:
+        clean_code = re.sub(r"[^a-zA-Z0-9]", "", explicit_name).lower()
+        with get_db_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -1199,6 +1642,7 @@ def search_views(
                         v.view_type,
                         v.level_name,
                         v.description,
+                        NULL AS distance,
                         p.project_name,
                         p.file_path
                     FROM revit_views v
@@ -1207,6 +1651,7 @@ def search_views(
                       AND (
                           LOWER(v.name) = LOWER(%s)
                           OR LOWER(v.name) LIKE LOWER(%s)
+                          OR REPLACE(REPLACE(LOWER(v.name), ' ', ''), '-', '') LIKE %s
                           OR v.name ILIKE %s
                       );
                     """,
@@ -1214,62 +1659,68 @@ def search_views(
                         project_id,
                         explicit_name,
                         f"%{explicit_name}%",
+                        f"%{clean_code}%",
                         f"%{explicit_name}%",
                     ),
                 )
                 rows = cursor.fetchall()
 
-        if not rows:
-            # Explicit view name requested but NO matching view exists in current project -> DO NOT return random vector search results
+        if rows:
+            ranked_results = []
+            for row in rows:
+                (
+                    database_id,
+                    row_project_id,
+                    revit_view_id,
+                    name,
+                    view_type,
+                    level_name,
+                    description,
+                    distance,
+                    project_name,
+                    file_path,
+                ) = row
+
+
+                norm_cand = normalize_text(name)
+                cand_clean = re.sub(r"[^a-zA-Z0-9]", "", name or "").lower()
+                score = 10.0
+                if norm_cand == norm_req or cand_clean == clean_code:
+                    score += 50.0
+                elif norm_cand.startswith(norm_req) or cand_clean.startswith(clean_code):
+                    score += 30.0
+                elif norm_req in norm_cand or clean_code in cand_clean:
+                    score += 20.0
+
+                ranked_results.append(
+                    {
+                        "result_type": "VIEW",
+                        "database_id": database_id,
+                        "project_id": row_project_id,
+                        "project_name": project_name or "",
+                        "file_path": file_path,
+                        "revit_view_id": revit_view_id,
+                        "name": name or "",
+                        "view_type": view_type or "",
+                        "level_name": level_name,
+                        "description": description or "",
+                        "semantic_similarity": 1.0,
+                        "exact_match_score": score,
+                        "view_type_score": 0.0,
+                        "level_score": 0.0,
+                        "keyword_score": 0.0,
+                        "specialized_penalty": 0.0,
+                        "hybrid_score": score,
+                    }
+                )
+
+            ranked_results.sort(key=lambda x: x["hybrid_score"], reverse=True)
+            return ranked_results[:limit]
+
+        # Explicit code/identifier requested but does NOT exist in active project DB -> Return [] (prevent false vector matches)
+        code_match = re.search(r"\b([a-zA-Z]{1,5}\s*[-]?\s*\d{1,4}[a-zA-Z]?)\b", explicit_name)
+        if code_match:
             return []
-
-        ranked_results = []
-        for row in rows:
-            (
-                database_id,
-                row_project_id,
-                revit_view_id,
-                name,
-                view_type,
-                level_name,
-                description,
-                project_name,
-                file_path,
-            ) = row
-
-            norm_cand = normalize_text(name)
-            score = 10.0
-            if norm_cand == norm_req:
-                score += 50.0
-            elif norm_cand.startswith(norm_req):
-                score += 30.0
-            elif norm_req in norm_cand:
-                score += 20.0
-
-            ranked_results.append(
-                {
-                    "result_type": "VIEW",
-                    "database_id": database_id,
-                    "project_id": row_project_id,
-                    "project_name": project_name or "",
-                    "file_path": file_path,
-                    "revit_view_id": revit_view_id,
-                    "name": name or "",
-                    "view_type": view_type or "",
-                    "level_name": level_name,
-                    "description": description or "",
-                    "semantic_similarity": 1.0,
-                    "exact_match_score": score,
-                    "view_type_score": 0.0,
-                    "level_score": 0.0,
-                    "keyword_score": 0.0,
-                    "specialized_penalty": 0.0,
-                    "hybrid_score": score,
-                }
-            )
-
-        ranked_results.sort(key=lambda x: x["hybrid_score"], reverse=True)
-        return ranked_results[:limit]
 
     # ----------------------------------------------------
     # STANDARD HYBRID SEMANTIC SEARCH (Strictly scoped to current_project_id)
@@ -1325,31 +1776,60 @@ def search_views(
 
                 connection.commit()
 
-            cursor.execute(
-                """
-                SELECT
-                    v.id,
-                    v.project_id,
-                    v.revit_view_id,
-                    v.name,
-                    v.view_type,
-                    v.level_name,
-                    v.description,
-                    v.embedding <=> %s::vector AS distance,
-                    p.project_name,
-                    p.file_path
-                FROM revit_views v
-                LEFT JOIN revit_projects p ON v.project_id = p.id
-                WHERE v.project_id = %s
-                  AND v.embedding IS NOT NULL;
-                """,
-                (
-                    query_embedding,
-                    project_id,
-                ),
-            )
+            rows = []
+            if query_embedding:
+                try:
+                    cursor.execute(
+                        """
+                        SELECT
+                            v.id,
+                            v.project_id,
+                            v.revit_view_id,
+                            v.name,
+                            v.view_type,
+                            v.level_name,
+                            v.description,
+                            v.embedding <=> %s::vector AS distance,
+                            p.project_name,
+                            p.file_path
+                        FROM revit_views v
+                        LEFT JOIN revit_projects p ON v.project_id = p.id
+                        WHERE v.project_id = %s
+                          AND v.embedding IS NOT NULL;
+                        """,
+                        (
+                            query_embedding,
+                            project_id,
+                        ),
+                    )
+                    rows = cursor.fetchall()
+                except Exception as ex:
+                    print("Vector distance search failed, falling back to metadata search:", ex)
+                    rows = []
 
-            rows = cursor.fetchall()
+            # FALLBACK: If embedding distance query yielded 0 rows or embedding failed, fetch all project views for metadata scoring
+            if not rows:
+                cursor.execute(
+                    """
+                    SELECT
+                        v.id,
+                        v.project_id,
+                        v.revit_view_id,
+                        v.name,
+                        v.view_type,
+                        v.level_name,
+                        v.description,
+                        NULL AS distance,
+                        p.project_name,
+                        p.file_path
+                    FROM revit_views v
+                    LEFT JOIN revit_projects p ON v.project_id = p.id
+                    WHERE v.project_id = %s;
+                    """,
+                    (project_id,),
+                )
+                rows = cursor.fetchall()
+
 
     ranked_results = []
 

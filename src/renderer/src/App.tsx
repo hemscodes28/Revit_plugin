@@ -144,15 +144,22 @@ function App() {
         action: actionName.toUpperCase(),
       }
 
-      console.log('Executing Revit action via Electron API:', payload)
+      console.log('Executing Revit action:', payload)
+      let res: { success?: boolean; message?: string } | null = null
 
       if (window.electronAPI && window.electronAPI.openRevitResult) {
-        const response = await window.electronAPI.openRevitResult(payload as any)
-        if (!response.success) {
-          setError(response.message || 'Revit action failed.')
-        }
+        res = await window.electronAPI.openRevitResult(payload as any)
       } else {
-        console.warn('window.electronAPI is not available in non-Electron preview mode.')
+        const response = await fetch('http://127.0.0.1:8000/revit-action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+        res = await response.json()
+      }
+
+      if (res && !res.success) {
+        setError(res.message || 'Revit action failed.')
       }
     } catch (err) {
       console.error('Revit action error:', err)

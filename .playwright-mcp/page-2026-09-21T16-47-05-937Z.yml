@@ -1,0 +1,44 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - img "RevitAI" [ref=e8]
+        - generic [ref=e9]: RevitAI
+      - button [ref=e11] [cursor=pointer]
+    - button "New Chat" [ref=e16] [cursor=pointer]
+    - textbox "Search conversations..." [ref=e23]
+    - generic [ref=e25]:
+      - generic [ref=e26]: Today
+      - generic [ref=e27] [cursor=pointer]:
+        - generic "Current Project Info" [ref=e30]
+        - button [ref=e32]
+      - generic [ref=e37] [cursor=pointer]:
+        - generic "Current Project Info" [ref=e40]
+        - button [ref=e42]
+  - generic [ref=e47]:
+    - banner [ref=e48]:
+      - button [ref=e51] [cursor=pointer]
+      - generic [ref=e59]:
+        - generic [ref=e60]: Current Project
+        - generic [ref=e61]: No Active Project
+      - generic [ref=e62]:
+        - generic [ref=e63]: Connected
+        - generic [ref=e69]:
+          - button [ref=e71] [cursor=pointer]
+          - button [ref=e74] [cursor=pointer]
+    - main [ref=e78]:
+      - generic [ref=e84]:
+        - generic [ref=e85]:
+          - generic [ref=e86]: You
+          - generic [ref=e87]: 22:10
+        - generic [ref=e88]: what is the exsisting project , that i am working on
+      - generic [ref=e94]:
+        - generic [ref=e95]:
+          - generic [ref=e96]: RevitAI
+          - generic [ref=e97]: 22:10
+        - generic [ref=e98]: "I'm not sure which Revit view you're looking for. Could you specify a level or view type? For example: 'Open L1 floor plan' or 'Show 3D view'."
+    - contentinfo [ref=e99]:
+      - generic [ref=e100]:
+        - textbox "Ask RevitAI anything about views, sheets, or model elements..." [ref=e101]
+        - button [disabled] [ref=e103]
+      - generic [ref=e107]: Press Enter to send • Shift + Enter for new line

@@ -1,0 +1,5 @@
+[     240ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:5173/@fs/C:/Users/Hemkumar%20Ramesh/Documents/RevitAI/node_modules/.vite/deps/react-dom_client.js?v=d50b2c71:20100
+[     487ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://localhost:5173/favicon.ico:0
+[ 1884417ms] [ERROR] Failed to load resource: net::ERR_INSUFFICIENT_RESOURCES @ http://127.0.0.1:8000/current-project:0
+[ 2520444ms] [ERROR] Failed to load resource: net::ERR_INSUFFICIENT_RESOURCES @ http://127.0.0.1:8000/current-project:0
+[ 2538407ms] [ERROR] Failed to load resource: net::ERR_INSUFFICIENT_RESOURCES @ http://127.0.0.1:8000/current-project:0

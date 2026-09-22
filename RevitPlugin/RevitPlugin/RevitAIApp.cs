@@ -21,8 +21,13 @@ namespace RevitPlugin
         private static HttpListener httpListener;
         private static bool serverRunning = false;
 
-        private const string ServerUrl =
-            "http://127.0.0.1:8765/";
+        public static string CachedProjectName { get; private set; } = null;
+        public static string CachedFilePath { get; private set; } = null;
+        public static int? CachedProjectId { get; private set; } = null;
+        public static bool CachedSynced { get; private set; } = false;
+
+        private static readonly int[] CandidatePorts = new int[] { 8765, 8766, 8767, 8768, 8769, 8770 };
+        public static int ActiveHttpPort { get; private set; } = 8765;
 
         private const string DebugFile =
             @"C:\Users\Hemkumar Ramesh\Documents\RevitAI\revit-debug.txt";
@@ -45,6 +50,18 @@ namespace RevitPlugin
 
                 Log("ExternalEvent created successfully");
 
+                // Subscribe to DocumentOpened and ViewActivated to track project switching & auto-sync
+                try
+                {
+                    application.ControlledApplication.DocumentOpened += OnDocumentOpened;
+                    application.ViewActivated += OnViewActivated;
+                    Log("DocumentOpened and ViewActivated event handlers registered successfully.");
+                }
+                catch (Exception evtEx)
+                {
+                    Log("Warning: Could not register document event handlers: " + evtEx.Message);
+                }
+
                 CreateRibbon(application);
 
                 StartHttpServer();
@@ -63,6 +80,80 @@ namespace RevitPlugin
                     ex.Message);
 
                 return Result.Failed;
+            }
+        }
+
+        private void OnDocumentOpened(object sender, Autodesk.Revit.DB.Events.DocumentOpenedEventArgs e)
+        {
+            try
+            {
+                if (e.Document != null && !e.Document.IsFamilyDocument)
+                {
+                    Log("OnDocumentOpened: " + e.Document.Title);
+                    UpdateActiveProjectState(e.Document);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("OnDocumentOpened ERROR: " + ex.Message);
+            }
+        }
+
+        private void OnViewActivated(object sender, Autodesk.Revit.UI.Events.ViewActivatedEventArgs e)
+        {
+            try
+            {
+                if (e.Document != null && !e.Document.IsFamilyDocument)
+                {
+                    UpdateActiveProjectState(e.Document);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("OnViewActivated ERROR: " + ex.Message);
+            }
+        }
+
+        public static void UpdateActiveProjectState(Document doc)
+        {
+            if (doc == null || doc.IsFamilyDocument) return;
+
+            try
+            {
+                string projectName = doc.Title;
+                string rawPath = doc.PathName;
+                string normalizedPath = NormalizeFilePath(rawPath);
+
+                CachedProjectName = projectName;
+                CachedFilePath = normalizedPath;
+
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        using (NpgsqlConnection conn = new NpgsqlConnection(PostgreSQLConfig.ConnectionString))
+                        {
+                            conn.Open();
+                            int projId = RevitAIExternalEventHandler.GetOrCreateProject(conn, null, projectName, normalizedPath);
+                            CachedProjectId = projId;
+                            CachedSynced = RevitAIExternalEventHandler.IsProjectSyncedInDatabase(projId);
+
+                            using (NpgsqlCommand cmd = new NpgsqlCommand("UPDATE revit_projects SET updated_at = CURRENT_TIMESTAMP WHERE id = @id;", conn))
+                            {
+                                cmd.Parameters.AddWithValue("id", projId);
+                                cmd.ExecuteNonQuery();
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("UpdateActiveProjectState async ERROR: " + ex.Message);
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                Log("UpdateActiveProjectState ERROR: " + ex.Message);
             }
         }
 
@@ -220,94 +311,80 @@ namespace RevitPlugin
             httpServerThread.Start();
 
             Log(
-                "HTTP server thread started on " +
-                ServerUrl);
+                "HTTP server thread started on candidate ports 8765-8770.");
         }
 
         private void HttpServerLoop()
         {
-            HttpListener listener =
-                new HttpListener();
+            HttpListener listener = null;
+            int boundPort = -1;
 
-            try
-            {
-                httpListener = listener;
-
-                listener.Prefixes.Add(ServerUrl);
-
-                listener.Start();
-
-                Log(
-                    "HTTP server listening on " +
-                    ServerUrl);
-
-                while (serverRunning)
-                {
-                    try
-                    {
-                        HttpListenerContext context =
-                            listener.GetContext();
-
-                        ThreadPool.QueueUserWorkItem(
-                            _ =>
-                            {
-                                HandleRequest(
-                                    context);
-                            });
-                    }
-                    catch (HttpListenerException ex)
-                    {
-                        if (!serverRunning)
-                        {
-                            break;
-                        }
-
-                        Log(
-                            "HTTP listener loop ERROR: " +
-                            ex);
-                    }
-                    catch (ObjectDisposedException)
-                    {
-                        if (!serverRunning)
-                        {
-                            break;
-                        }
-
-                        Log(
-                            "HTTP listener disposed unexpectedly.");
-                    }
-                    catch (Exception ex)
-                    {
-                        Log(
-                            "HTTP listener loop ERROR: " +
-                            ex);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log(
-                    "HTTP server startup ERROR: " +
-                    ex);
-            }
-            finally
+            foreach (int port in CandidatePorts)
             {
                 try
                 {
-                    listener.Stop();
-                    listener.Close();
+                    listener = new HttpListener();
+                    string prefix = $"http://127.0.0.1:{port}/";
+                    listener.Prefixes.Add(prefix);
+                    listener.Start();
+                    boundPort = port;
+                    ActiveHttpPort = port;
+                    Log($"HTTP server listening on {prefix}");
+                    break;
                 }
-                catch
+                catch (Exception ex)
                 {
+                    Log($"HTTP server startup warning on port {port}: {ex.Message}");
+                    try { listener?.Close(); } catch {}
+                    listener = null;
                 }
-
-                if (ReferenceEquals(httpListener, listener))
-                {
-                    httpListener = null;
-                }
-
-                Log("HTTP server stopped");
             }
+
+            if (listener == null || boundPort == -1)
+            {
+                Log("HTTP server FATAL ERROR: Could not bind any candidate port (8765-8770).");
+                serverRunning = false;
+                return;
+            }
+
+            httpListener = listener;
+
+            while (serverRunning)
+            {
+                try
+                {
+                    HttpListenerContext context = listener.GetContext();
+                    ThreadPool.QueueUserWorkItem(_ => HandleRequest(context));
+                }
+                catch (HttpListenerException ex)
+                {
+                    if (!serverRunning) break;
+                    Log("HTTP listener loop ERROR: " + ex);
+                }
+                catch (ObjectDisposedException)
+                {
+                    if (!serverRunning) break;
+                    Log("HTTP listener disposed unexpectedly.");
+                }
+                catch (Exception ex)
+                {
+                    Log("HTTP listener loop ERROR: " + ex);
+                }
+            }
+
+            try
+            {
+                listener.Stop();
+                listener.Close();
+            }
+            catch {}
+
+            if (ReferenceEquals(httpListener, listener))
+            {
+                httpListener = null;
+            }
+
+            Log("HTTP server stopped");
         }
 
         private void HandleRequest(
@@ -316,7 +393,14 @@ namespace RevitPlugin
             try
             {
                 Log("----------------------------------------");
-                Log("HTTP request received");
+                Log("HTTP request received: " + context.Request.HttpMethod + " " + context.Request.Url.AbsolutePath);
+
+                // Handle CORS OPTIONS pre-flight
+                if (context.Request.HttpMethod.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase))
+                {
+                    SendHttpResponse(context, 200, "text/plain", "OK");
+                    return;
+                }
 
                 string requestBody;
 
@@ -370,40 +454,35 @@ namespace RevitPlugin
 
                         bool completed =
                             completionEvent.Wait(
-                                TimeSpan.FromSeconds(10));
+                                TimeSpan.FromMilliseconds(250));
 
-                        if (!completed)
+                        if (completed)
                         {
-                            Log(
-                                "Current project request timed out.");
+                            string projectResponse =
+                                externalEventHandler.GetResponse();
 
-                            SendHttpResponse(
-                                context,
-                                504,
-                                "application/json",
-                                "{\"success\":false,\"message\":\"Timed out while reading the active Revit project.\"}");
+                            if (!string.IsNullOrWhiteSpace(projectResponse))
+                            {
+                                SendHttpResponse(
+                                    context,
+                                    200,
+                                    "application/json",
+                                    projectResponse);
 
-                            return;
+                                Log("Current project response sent successfully via ExternalEvent");
+                                return;
+                            }
                         }
 
-                        string projectResponse =
-                            externalEventHandler.GetResponse();
-
-                        if (string.IsNullOrWhiteSpace(projectResponse))
-                        {
-                            projectResponse =
-                                "{\"success\":false,\"message\":\"Revit did not return project information.\"}";
-                        }
-
+                        // Fast non-blocking fallback to cached active project / PostgreSQL DB
+                        string fallbackJson = GetCachedOrDatabaseProjectResponse();
                         SendHttpResponse(
                             context,
                             200,
                             "application/json",
-                            projectResponse);
+                            fallbackJson);
 
-                        Log(
-                            "Current project response sent successfully");
-
+                        Log("Current project response sent via cached/database fallback.");
                         return;
                     }
                 }
@@ -491,12 +570,72 @@ namespace RevitPlugin
             }
         }
 
+        private string GetCachedOrDatabaseProjectResponse()
+        {
+            try
+            {
+                string pName = CachedProjectName;
+                string pPath = CachedFilePath;
+                int? pId = CachedProjectId;
+                bool synced = CachedSynced;
+
+                if (string.IsNullOrEmpty(pName) || !pId.HasValue)
+                {
+                    using (NpgsqlConnection conn = new NpgsqlConnection(PostgreSQLConfig.ConnectionString))
+                    {
+                        conn.Open();
+                        using (NpgsqlCommand cmd = new NpgsqlCommand(
+                            "SELECT id, project_name, file_path FROM revit_projects ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1;", conn))
+                        {
+                            using (NpgsqlDataReader reader = cmd.ExecuteReader())
+                            {
+                                if (reader.Read())
+                                {
+                                    pId = reader.GetInt32(0);
+                                    pName = reader.GetString(1);
+                                    pPath = reader.IsDBNull(2) ? null : reader.GetString(2);
+                                    synced = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(pName) && pId.HasValue)
+                {
+                    string pathJson = pPath == null ? "null" : "\"" + RevitAIApp.JsonEscape(pPath) + "\"";
+                    return "{"
+                        + "\"success\":true,"
+                        + "\"synced\":" + (synced ? "true" : "false") + ","
+                        + "\"project_id\":" + pId.Value + ","
+                        + "\"project_name\":\"" + RevitAIApp.JsonEscape(pName) + "\","
+                        + "\"file_path\":" + pathJson + ","
+                        + "\"message\":\"Active Revit project resolved from plugin state/database.\""
+                        + "}";
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("GetCachedOrDatabaseProjectResponse ERROR: " + ex.Message);
+            }
+
+            return "{\"success\":false,\"message\":\"No active Revit project is currently connected.\"}";
+        }
+
         private void SendHttpResponse(
             HttpListenerContext context,
             int statusCode,
             string contentType,
             string responseText)
         {
+            try
+            {
+                context.Response.AddHeader("Access-Control-Allow-Origin", "*");
+                context.Response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                context.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+            }
+            catch {}
+
             byte[] responseBytes =
                 Encoding.UTF8.GetBytes(
                     responseText ?? "");
@@ -900,6 +1039,8 @@ namespace RevitPlugin
             }
         }
 
+        private static string lastSyncedDocIdentity = null;
+
         private string GetCurrentProject(
             UIApplication app)
         {
@@ -932,6 +1073,8 @@ namespace RevitPlugin
                 string normalizedPath =
                     RevitAIApp.NormalizeFilePath(rawFilePath);
 
+                string currentDocIdentity = (normalizedPath ?? projectName);
+
                 int? projectId =
                     FindProjectId(
                         projectName,
@@ -946,16 +1089,17 @@ namespace RevitPlugin
 
                 // ============================================================
                 // AUTOMATIC PROJECT SYNCHRONIZATION REQUIREMENT
-                // If project is not in database or has no views synchronized,
-                // automatically synchronize its Revit data now.
+                // Perform automatic sync if project identity changed or not synced.
                 // ============================================================
-                if (!projectId.HasValue || !isSynced)
+                if (!projectId.HasValue || !isSynced || lastSyncedDocIdentity != currentDocIdentity)
                 {
                     RevitAIApp.Log(
-                        "Active document '" + projectName + "' is not synchronized. " +
+                        "Active document '" + projectName + "' identity check triggered auto-sync. " +
                         "Performing automatic project synchronization...");
 
                     SyncProjectViews(app);
+
+                    lastSyncedDocIdentity = currentDocIdentity;
 
                     projectId =
                         FindProjectId(
@@ -1020,6 +1164,7 @@ namespace RevitPlugin
                     + "}";
             }
         }
+
 
         public static bool IsProjectSyncedInDatabase(
             int projectId)
@@ -1089,10 +1234,9 @@ namespace RevitPlugin
                 RevitAIApp.Log("Syncing document: " + projectName);
                 RevitAIApp.Log("Normalized path: " + (normalizedPath ?? "[UNSAVED PROJECT]"));
 
-                FilteredElementCollector collector =
-                    new FilteredElementCollector(doc).OfClass(typeof(View));
-
                 int viewCount = 0;
+                int sheetCount = 0;
+                int elementCount = 0;
                 int projectId = 0;
 
                 using (
@@ -1116,6 +1260,16 @@ namespace RevitPlugin
 
                             RevitAIApp.Log("Project ID resolved: " + projectId);
 
+                            // Ensure sheet_number and sheet_name columns exist on revit_views
+                            using (NpgsqlCommand alterViewsCmd = new NpgsqlCommand(
+                                @"ALTER TABLE revit_views ADD COLUMN IF NOT EXISTS sheet_number VARCHAR(100);
+                                  ALTER TABLE revit_views ADD COLUMN IF NOT EXISTS sheet_name VARCHAR(255);",
+                                connection,
+                                transaction))
+                            {
+                                alterViewsCmd.ExecuteNonQuery();
+                            }
+
                             // ====================================================
                             // PROJECT-SCOPED SYNCHRONIZATION:
                             // DELETE ONLY THIS PROJECT'S EXISTING VIEWS
@@ -1133,7 +1287,23 @@ namespace RevitPlugin
                                 RevitAIApp.Log("Deleted old views for project " + projectId + ": " + deletedRows);
                             }
 
-                            foreach (Element element in collector)
+                            // Collect all Views and ViewSheets
+                            System.Collections.Generic.List<Element> allViewsAndSheets = new System.Collections.Generic.List<Element>();
+                            FilteredElementCollector viewCollector = new FilteredElementCollector(doc).OfClass(typeof(View));
+                            allViewsAndSheets.AddRange(viewCollector.ToElements());
+
+                            FilteredElementCollector sheetCollector = new FilteredElementCollector(doc).OfClass(typeof(ViewSheet));
+                            foreach (Element sheetElem in sheetCollector)
+                            {
+                                if (!allViewsAndSheets.Exists(e => e.Id == sheetElem.Id))
+                                {
+                                    allViewsAndSheets.Add(sheetElem);
+                                }
+                            }
+
+                            System.Collections.Generic.HashSet<long> processedViewIds = new System.Collections.Generic.HashSet<long>();
+
+                            foreach (Element element in allViewsAndSheets)
                             {
                                 View view = element as View;
                                 if (view == null || view.IsTemplate)
@@ -1141,18 +1311,88 @@ namespace RevitPlugin
                                     continue;
                                 }
 
+                                if (processedViewIds.Contains(view.Id.Value))
+                                {
+                                    continue;
+                                }
+                                processedViewIds.Add(view.Id.Value);
+
                                 string viewType = view.ViewType.ToString();
                                 string viewName = view.Name;
+                                string sheetNumber = null;
+                                string sheetName = null;
 
                                 Autodesk.Revit.DB.ViewSheet sheet = view as Autodesk.Revit.DB.ViewSheet;
-                                if (sheet != null)
+                                if (sheet != null || view.ViewType.ToString().Equals("DrawingSheet", StringComparison.OrdinalIgnoreCase))
                                 {
                                     viewType = "DrawingSheet";
-                                    if (!string.IsNullOrEmpty(sheet.SheetNumber) && !viewName.StartsWith(sheet.SheetNumber))
+                                    if (sheet != null)
                                     {
-                                        viewName = sheet.SheetNumber + " - " + sheet.Name;
+                                        sheetNumber = sheet.SheetNumber != null ? sheet.SheetNumber.Trim() : null;
+                                        sheetName = sheet.Name != null ? sheet.Name.Trim() : null;
                                     }
+
+                                    if (string.IsNullOrEmpty(sheetNumber))
+                                    {
+                                        try
+                                        {
+                                            Parameter param = view.get_Parameter(BuiltInParameter.SHEET_NUMBER);
+                                            if (param != null && param.HasValue)
+                                            {
+                                                sheetNumber = param.AsString()?.Trim();
+                                            }
+                                        }
+                                        catch { }
+                                    }
+
+                                    if (string.IsNullOrEmpty(sheetName))
+                                    {
+                                        try
+                                        {
+                                            Parameter param = view.get_Parameter(BuiltInParameter.SHEET_NAME);
+                                            if (param != null && param.HasValue)
+                                            {
+                                                sheetName = param.AsString()?.Trim();
+                                            }
+                                        }
+                                        catch { }
+                                        sheetName = sheetName ?? view.Name;
+                                    }
+
+                                    if (!string.IsNullOrEmpty(sheetNumber))
+                                    {
+                                        if (!string.IsNullOrEmpty(sheetName) && !viewName.StartsWith(sheetNumber))
+                                        {
+                                            viewName = sheetNumber + " - " + sheetName;
+                                        }
+                                        else if (!viewName.StartsWith(sheetNumber))
+                                        {
+                                            viewName = sheetNumber + " - " + viewName;
+                                        }
+                                    }
+                                    sheetCount++;
                                 }
+                                 else
+                                 {
+                                     viewCount++;
+                                     try
+                                     {
+                                         Parameter sheetNumParam = view.get_Parameter(BuiltInParameter.VIEWPORT_SHEET_NUMBER);
+                                         if (sheetNumParam != null && sheetNumParam.HasValue)
+                                         {
+                                             string pVal = sheetNumParam.AsString();
+                                             if (!string.IsNullOrWhiteSpace(pVal) && pVal != "---")
+                                             {
+                                                 sheetNumber = pVal.Trim();
+                                                 if (!viewName.StartsWith(sheetNumber))
+                                                 {
+                                                     viewName = sheetNumber + " - " + viewName;
+                                                 }
+                                             }
+                                         }
+                                     }
+                                     catch { }
+                                 }
 
                                 string description = BuildViewDescription(view);
                                 string levelName = GetViewLevelName(view);
@@ -1161,9 +1401,9 @@ namespace RevitPlugin
                                     NpgsqlCommand insertCommand =
                                         new NpgsqlCommand(
                                             @"INSERT INTO revit_views
-                                              (revit_view_id, name, view_type, description, level_name, project_id)
+                                              (revit_view_id, name, view_type, description, level_name, project_id, sheet_number, sheet_name)
                                               VALUES
-                                              (@revit_view_id, @name, @view_type, @description, @level_name, @project_id);",
+                                              (@revit_view_id, @name, @view_type, @description, @level_name, @project_id, @sheet_number, @sheet_name);",
                                             connection,
                                             transaction))
                                 {
@@ -1173,11 +1413,11 @@ namespace RevitPlugin
                                     insertCommand.Parameters.AddWithValue("description", description);
                                     insertCommand.Parameters.AddWithValue("level_name", (object)levelName ?? DBNull.Value);
                                     insertCommand.Parameters.AddWithValue("project_id", projectId);
+                                    insertCommand.Parameters.AddWithValue("sheet_number", (object)sheetNumber ?? DBNull.Value);
+                                    insertCommand.Parameters.AddWithValue("sheet_name", (object)sheetName ?? DBNull.Value);
 
                                     insertCommand.ExecuteNonQuery();
                                 }
-
-                                viewCount++;
                             }
 
                             // Optional Element Sync
@@ -1250,6 +1490,7 @@ namespace RevitPlugin
                                         insertElemCmd.Parameters.AddWithValue("level_name", (object)elemLevelName ?? DBNull.Value);
                                         insertElemCmd.Parameters.AddWithValue("project_id", projectId);
                                         insertElemCmd.ExecuteNonQuery();
+                                        elementCount++;
                                     }
                                 }
                             }
@@ -1272,7 +1513,7 @@ namespace RevitPlugin
                     connection.Close();
                 }
 
-                RevitAIApp.Log("Total views synchronized: " + viewCount);
+                RevitAIApp.Log($"[SYNC] Project: {projectName} (ID: {projectId}) | Views: {viewCount} | Sheets: {sheetCount} | Elements: {elementCount}");
 
                 return
                     "{"
@@ -1280,6 +1521,8 @@ namespace RevitPlugin
                     + "\"project_id\":" + projectId + ","
                     + "\"project_name\":\"" + RevitAIApp.JsonEscape(projectName) + "\","
                     + "\"views_count\":" + viewCount + ","
+                    + "\"sheets_count\":" + sheetCount + ","
+                    + "\"elements_count\":" + elementCount + ","
                     + "\"message\":\"Project synchronization completed successfully.\""
                     + "}";
             }

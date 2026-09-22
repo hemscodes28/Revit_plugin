@@ -1,0 +1,38 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - img "RevitAI" [ref=e8]
+        - generic [ref=e9]: RevitAI
+      - button [ref=e11] [cursor=pointer]
+    - button "New Chat" [active] [ref=e16] [cursor=pointer]
+    - textbox "Search conversations..." [ref=e23]
+    - generic [ref=e25]:
+      - generic [ref=e26]: Today
+      - generic [ref=e119] [cursor=pointer]:
+        - generic "New Chat" [ref=e122]
+        - button [ref=e124]
+      - generic [ref=e27] [cursor=pointer]:
+        - generic "Current Project Info" [ref=e84]
+        - button [ref=e32]
+  - generic [ref=e37]:
+    - banner [ref=e38]:
+      - button [ref=e41] [cursor=pointer]
+      - generic [ref=e49]:
+        - generic [ref=e50]: Current Project
+        - generic [ref=e51]: Snowdon Towers Sample HVAC
+      - generic [ref=e52]:
+        - generic [ref=e53]: Connected
+        - generic [ref=e59]:
+          - button [ref=e61] [cursor=pointer]
+          - button [ref=e64] [cursor=pointer]
+    - main [ref=e68]:
+      - generic [ref=e130]:
+        - img "RevitAI Logo" [ref=e132]
+        - heading "RevitAI" [level=2] [ref=e133]
+        - paragraph [ref=e134]: Your intelligent assistant for Autodesk Revit. Find views, sheets, levels, and model elements using natural language.
+    - contentinfo [ref=e75]:
+      - generic [ref=e76]:
+        - textbox "Ask RevitAI anything about views, sheets, or model elements..." [ref=e77]
+        - button [disabled] [ref=e79]
+      - generic [ref=e83]: Press Enter to send • Shift + Enter for new line

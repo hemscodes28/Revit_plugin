@@ -41,9 +41,9 @@ SYSTEM_PROMPT = """You are the Intent Classification and Entity Extraction engin
 Your job is to classify the user's message into one of these strict intents:
 - GENERAL_CONVERSATION: Normal greetings, small talk, casual check-ins, social phrases, personal inquiries, farewells (e.g. hello, hi, helo, ello, how are you, how was ur day, whats up, are you okay, tell me about yourself, thanks, bye, okay).
 - HELP: Questions about what RevitAI can do or how to use it (e.g. what can you do, help, commands, how to use).
-- PROJECT_INFO: User is asking about the active or current Revit project, file, or model name (e.g. what project am I working on, which project is open, what revit file am i using, current project, current model, project info, show project info).
-- REVIT_SEARCH: User wants to search or find specific Revit views, floor plans, levels, rooms, walls, sheets, schedules, elevations, 3D views (e.g. show me L3 floor plan, find rooms on L5, L3 wall plans).
-- REVIT_ACTION: User explicitly wants to open a view in Revit (e.g. open L1 floor plan, open Rooms - L5).
+- PROJECT_INFO: User is asking about the active or current Revit project, file, model name, or revit links/linked models (e.g. what project am I working on, which project is open, what revit file am i using, current project, what are all the revit links, show revit links, linked models).
+- REVIT_SEARCH: User wants to search or find specific Revit views, floor plans, levels, rooms, walls, sheets, schedules, elevations, 3D views, or sheet numbers/codes (e.g. show me L3 floor plan, find rooms on L5, SD105, show sd105, SD 105, A101, L3 wall plans).
+- REVIT_ACTION: User explicitly wants to open a view or sheet in Revit (e.g. open L1 floor plan, open SD105, open Rooms - L5).
 - FOLLOW_UP: User is referring to a previous search or result (e.g. only wall plans, open the first one, what about level 3, no I meant L5).
 - CLARIFICATION_REQUIRED: Message is ambiguous, too short without context, or intent confidence is low.
 
@@ -101,6 +101,11 @@ TYPO_MAP = {
     "wazzup": "whats up",
     "ok": "okay",
     "okayy": "okay",
+    "exsisting": "existing",
+    "exisitng": "existing",
+    "exisiting": "existing",
+    "existin": "existing",
+
     # Domain typos
     "flor": "floor",
     "fllor": "floor",
@@ -186,6 +191,13 @@ PROJECT_INFO_PHRASES = {
     "tell me the active project name",
     "active project name",
     "project name",
+    "what are all the revit links",
+    "what are the revit links",
+    "show revit links",
+    "revit links",
+    "linked models",
+    "linked revit files",
+    "list revit links",
 }
 
 ADDRESSING_TERMS = {
@@ -338,11 +350,15 @@ def fallback_intent_classifier(user_message: str, session_context: dict | None =
                     "tell me which model", "current revit project", "project info",
                     "current project info", "active project info", "active project",
                     "project name", "current project", "active model",
+                    "existing project", "exsisting project", "project that i am working on",
+                    "project i am working on", "file that i am working on", "file i am working on",
+                    "model that i am working on", "model i am working on", "working on",
                 ]
             )
         )
         and entities.get("level") is None
     )
+
 
     if is_project_info:
         return {
@@ -468,11 +484,13 @@ def fallback_intent_classifier(user_message: str, session_context: dict | None =
             }
 
     # 6. REVIT_SEARCH / REVIT_ACTION
+    has_sheet_code = bool(re.search(r"\b([a-zA-Z]{1,5}\s*[-]?\s*\d{1,4})\b", norm))
     has_revit_indicators = (
         entities["level"] is not None
         or entities["viewType"] is not None
         or entities["category"] is not None
-        or any(w in norm for w in ["find", "search", "show", "open", "view", "views", "plan", "level", "floor", "section", "elevation", "sheet"])
+        or has_sheet_code
+        or any(w in norm for w in ["find", "search", "show", "open", "view", "views", "plan", "level", "floor", "section", "elevation", "sheet", "sheets", "schedule", "schedules", "link", "links"])
     )
 
     if has_revit_indicators:
@@ -518,26 +536,39 @@ def classify_intent_with_gemini(user_message: str, session_context: dict | None 
 
         prompt = f"User Message: {user_message}{context_str}"
 
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        model_candidates = [
+            os.getenv("GEMINI_MODEL"),
+            "gemini-3.6-flash",
+            "gemini-2.5-flash",
+            "gemini-1.5-flash",
+            "gemini-2.0-flash-exp",
+        ]
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                temperature=0.1,
-            ),
-        )
+        model_candidates = [m for m in model_candidates if m]
 
-        raw_text = response.text.strip()
-        data = json.loads(raw_text)
+        for model_name in model_candidates:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
+                )
 
-        if "intent" in data and "confidence" in data:
-            return data
+                raw_text = response.text.strip()
+                data = json.loads(raw_text)
+
+                if "intent" in data and "confidence" in data:
+                    return data
+            except Exception as e:
+                print(f"Gemini API model '{model_name}' failed: {e}")
 
     except Exception as e:
-        print("Gemini API call failed or timed out:", e)
-        print("Using deterministic fallback intent classifier.")
+        print("Gemini API client error:", e)
 
     return fallback_intent_classifier(user_message, session_context)
+
+

@@ -219,22 +219,30 @@ def chat(
         # 2. PROJECT_INFO ("What project am I working on?", "Which project is open?")
         # ----------------------------------------------------
         if intent == "PROJECT_INFO":
-            active_info = get_active_project_info()
-            if active_info and active_info.get("success") and active_info.get("project_name"):
-                proj_name = active_info.get("project_name")
-                msg = f"You are currently working on **{proj_name}**."
-            else:
-                msg = "No active Revit project is currently connected or open."
+            # Check if query actually targets an explicit view/sheet entity code (e.g., "show file L3", "open file SD105")
+            from backend.semantic_search import search_exact_entity_project_scoped
+            exact_entities = search_exact_entity_project_scoped(user_message, active_id)
+            has_strong_exact_match = exact_entities and exact_entities[0].get("exact_match_score", 0) >= 95.0
+            
+            if not has_strong_exact_match:
+                active_info = get_active_project_info()
+                if active_info and active_info.get("success") and active_info.get("project_name"):
+                    proj_name = active_info.get("project_name")
+                    msg = f"You are currently working on **{proj_name}**."
+                else:
+                    msg = "No active Revit project is currently connected or open."
 
-            return {
-                "success": True,
-                "type": "message",
-                "intent": "PROJECT_INFO",
-                "message": msg,
-                "response": msg,
-                "target": "CONVERSATION",
-                "results": [],
-            }
+                return {
+                    "success": True,
+                    "type": "message",
+                    "intent": "PROJECT_INFO",
+                    "message": msg,
+                    "response": msg,
+                    "target": "CONVERSATION",
+                    "results": [],
+                }
+            else:
+                intent = "REVIT_SEARCH"
 
         # ----------------------------------------------------
         # 3. HELP
@@ -432,16 +440,20 @@ def chat(
         SESSION_CONTEXT["results"] = normalized_results
 
         # USER-FACING RESPONSE MESSAGE
-        if action.upper() == "OPEN":
+        if target == "ELEMENT":
+            cat_name = normalized_results[0].get("category", "element") if normalized_results else "element"
+            lvl_name = normalized_results[0].get("level_name") if normalized_results else None
+            lvl_str = f" on {lvl_name}" if lvl_name else ""
+            response_message = f"I found {len(normalized_results)} {cat_name.lower()} element(s){lvl_str}."
+        elif action.upper() == "OPEN":
             if len(normalized_results) == 1:
-                response_message = f"I found the best matching Revit view: {normalized_results[0]['name']}."
+                response_message = f"Found {normalized_results[0]['name']} in the active project."
             else:
-                response_message = f"I found {len(normalized_results)} matching Revit views."
+                response_message = f"I found {len(normalized_results)} matching views."
         else:
-            response_message = (
-                f"Search completed successfully. "
-                f"Found {len(normalized_results)} result(s)."
-            )
+            vtype_str = normalized_results[0].get("view_type", "view") if normalized_results else "view"
+            response_message = f"I found {len(normalized_results)} matching {vtype_str} result(s)."
+
 
         return {
             "success": True,
@@ -472,6 +484,52 @@ def chat(
             "target": "ERROR",
             "results": [],
         }
+
+
+# ============================================================
+# REVIT ACTION PROXY ENDPOINT
+# ============================================================
+
+class RevitActionRequest(BaseModel):
+    action: str = "OPEN"
+    name: Optional[str] = None
+    type: Optional[str] = None
+    description: Optional[str] = None
+    revit_view_id: Optional[int] = None
+    revit_element_id: Optional[int] = None
+    project_id: Optional[int] = None
+    file_path: Optional[str] = None
+
+
+@app.post("/revit-action")
+def execute_revit_action(request: RevitActionRequest):
+    import urllib.request
+    import json
+
+    ports = [8765, 8766, 8767, 8768, 8769, 8770]
+    payload = request.model_dump(exclude_none=True)
+    json_data = json.dumps(payload).encode("utf-8")
+
+    for port in ports:
+        try:
+            url = f"http://127.0.0.1:{port}/"
+            req = urllib.request.Request(
+                url,
+                data=json_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                if response.status == 200:
+                    res_body = response.read().decode("utf-8")
+                    return json.loads(res_body)
+        except Exception:
+            continue
+
+    return {
+        "success": False,
+        "message": "Could not communicate with the Revit plugin. Please check that Revit is open and active.",
+    }
 
 
 # ============================================================

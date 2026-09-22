@@ -1,0 +1,85 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - img "RevitAI" [ref=e8]
+        - generic [ref=e9]: RevitAI
+      - button [ref=e11] [cursor=pointer]
+    - button "New Chat" [ref=e16] [cursor=pointer]
+    - textbox "Search conversations..." [ref=e23]
+    - generic [ref=e25]:
+      - generic [ref=e26]: Today
+      - generic [ref=e108] [cursor=pointer]:
+        - generic "Current Project Info" [ref=e124]
+        - button [ref=e113]
+      - generic [ref=e27] [cursor=pointer]:
+        - generic "Current Project Info" [ref=e30]
+        - button [ref=e32]
+      - generic [ref=e37] [cursor=pointer]:
+        - generic "Current Project Info" [ref=e40]
+        - button [ref=e42]
+  - generic [ref=e47]:
+    - banner [ref=e48]:
+      - button [ref=e51] [cursor=pointer]
+      - generic [ref=e59]:
+        - generic [ref=e60]: Current Project
+        - generic [ref=e61]: Snowdon Towers Sample HVAC
+      - generic [ref=e62]:
+        - generic [ref=e63]: Connected
+        - generic [ref=e69]:
+          - button [ref=e71] [cursor=pointer]
+          - button [ref=e74] [cursor=pointer]
+    - main [ref=e78]:
+      - generic [ref=e130]:
+        - generic [ref=e131]:
+          - generic [ref=e132]: You
+          - generic [ref=e133]: 22:40
+        - generic [ref=e134]: what is the exsisting project , that i am working on
+      - generic [ref=e140]:
+        - generic [ref=e141]:
+          - generic [ref=e142]: RevitAI
+          - generic [ref=e143]: 22:40
+        - generic [ref=e144]: You are currently working on **Snowdon Towers Sample HVAC**.
+      - generic [ref=e150]:
+        - generic [ref=e151]:
+          - generic [ref=e152]: You
+          - generic [ref=e153]: 22:41
+        - generic [ref=e154]: open M1
+      - generic [ref=e160]:
+        - generic [ref=e161]:
+          - generic [ref=e162]: RevitAI
+          - generic [ref=e163]: 22:41
+        - generic [ref=e164]: Found M1 in the active project.
+        - generic [ref=e166]:
+          - generic [ref=e167]:
+            - generic [ref=e168]:
+              - generic [ref=e169]: FloorPlan
+              - heading "M1" [level=3] [ref=e175]
+            - generic [ref=e176]: Best Match
+          - paragraph [ref=e177]: "Floor plan view: M1. Level: M1. Floor plan for level M1."
+          - generic [ref=e178]:
+            - generic [ref=e179]:
+              - generic [ref=e180]: Level
+              - generic [ref=e181]: M1
+            - generic [ref=e182]:
+              - generic [ref=e183]: Revit ID
+              - generic [ref=e184]: "1363453"
+            - generic [ref=e185]:
+              - generic [ref=e186]: Project
+              - generic [ref=e187]: Snowdon Towers Sample HVAC
+          - button "Open in Revit" [ref=e189] [cursor=pointer]
+      - generic [ref=e200]:
+        - generic [ref=e201]:
+          - generic [ref=e202]: You
+          - generic [ref=e203]: 22:42
+        - generic [ref=e204]: open m203
+      - generic [ref=e210]:
+        - generic [ref=e211]:
+          - generic [ref=e212]: RevitAI
+          - generic [ref=e213]: 22:42
+        - generic [ref=e214]: I couldn't find an entity named 'm203' in the current Revit project.
+    - contentinfo [ref=e99]:
+      - generic [ref=e100]:
+        - textbox "Ask RevitAI anything about views, sheets, or model elements..." [ref=e101]
+        - button [disabled] [ref=e103]
+      - generic [ref=e107]: Press Enter to send • Shift + Enter for new line

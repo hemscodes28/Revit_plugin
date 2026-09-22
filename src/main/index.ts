@@ -38,174 +38,86 @@ function createWindow() {
 }
 
 
-ipcMain.handle(
-  'open-revit-result',
-  async (_event, result) => {
+ipcMain.handle('open-revit-result', async (_event, result) => {
+  console.log('')
+  console.log('================================')
+  console.log('Revit result received from React:', result)
+  console.log('================================')
 
-    console.log('')
-    console.log('================================')
-    console.log(
-      'Revit result received from React:'
-    )
-    console.log(result)
-    console.log('================================')
+  const candidatePorts = [8765, 8766, 8767, 8768, 8769, 8770]
 
-
+  for (const port of candidatePorts) {
     try {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 3000)
 
-      console.log(
-        'Attempting connection to Revit plugin...'
-      )
-
-      console.log(
-        'Target: http://127.0.0.1:8765/'
-      )
-
-
-      const controller =
-        new AbortController()
-
-      const timeout =
-        setTimeout(() => {
-
-          console.log(
-            'Revit connection timed out after 5 seconds'
-          )
-
-          controller.abort()
-
-        }, 5000)
-
-
-      console.log(
-        'Sending HTTP POST request...'
-      )
-
-
-      const response = await fetch(
-        'http://127.0.0.1:8765/',
-        {
-          method: 'POST',
-
-          headers: {
-            'Content-Type':
-              'application/json',
-          },
-
-          body: JSON.stringify(result),
-
-          signal: controller.signal,
-        }
-      )
-
+      const response = await fetch(`http://127.0.0.1:${port}/`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(result),
+        signal: controller.signal,
+      })
 
       clearTimeout(timeout)
 
+      if (response.ok) {
+        const responseText = await response.text()
+        console.log(`HTTP response received from Revit (port ${port}):`, responseText)
 
-      console.log(
-        'HTTP response received from Revit'
-      )
+        let parsedResponse: any = null
+        try {
+          parsedResponse = JSON.parse(responseText)
+        } catch {}
 
-      console.log(
-        'HTTP status:',
-        response.status
-      )
-
-
-      const responseText =
-        await response.text()
-
-
-      console.log(
-        'Revit plugin response:',
-        responseText
-      )
-
-
-      if (!response.ok) {
-
-        throw new Error(
-          `Revit returned HTTP ${response.status}: ${responseText}`
-        )
-
-      }
-
-      let parsedResponse: any = null
-      try {
-        parsedResponse = JSON.parse(responseText)
-      } catch {
-        // Not JSON
-      }
-
-      if (parsedResponse && typeof parsedResponse === 'object' && parsedResponse.success === false) {
-
-        return {
-          success: false,
-
-          message:
-            parsedResponse.message || 'The requested action failed in Revit.',
+        if (parsedResponse && typeof parsedResponse === 'object' && parsedResponse.success === false) {
+          return {
+            success: false,
+            message: parsedResponse.message || 'The requested action failed in Revit.',
+          }
         }
 
-      }
-
-      console.log(
-        'Revit communication successful'
-      )
-
-
-      return {
-        success: true,
-
-        message:
-          parsedResponse?.message || `Request sent to Revit: ${result.name}`,
-      }
-
-    }
-    catch (error) {
-
-      console.error('')
-      console.error(
-        '================================'
-      )
-      console.error(
-        'ERROR communicating with Revit'
-      )
-      console.error(
-        '================================'
-      )
-      console.error(error)
-
-
-      if (
-        error instanceof Error &&
-        error.name === 'AbortError'
-      ) {
-
         return {
-          success: false,
-
-          message:
-            'Connection to the Revit plugin timed out after 5 seconds.',
+          success: true,
+          message: parsedResponse?.message || `Request sent to Revit: ${result.name}`,
         }
-
       }
-
-
-      return {
-        success: false,
-
-        message:
-          `Could not communicate with the Revit plugin: ${
-            error instanceof Error
-              ? error.message
-              : 'Unknown error'
-          }`,
-      }
-
+    } catch {
+      // Port unreachable, try next candidate port
     }
-
   }
-)
+
+  // Fallback to FastAPI backend proxy endpoint
+  try {
+    console.log('Direct Revit ports failed. Trying FastAPI backend proxy http://127.0.0.1:8000/revit-action...')
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 5000)
+
+    const response = await fetch('http://127.0.0.1:8000/revit-action', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(result),
+      signal: controller.signal,
+    })
+
+    clearTimeout(timeout)
+
+    if (response.ok) {
+      const data = await response.json()
+      return data
+    }
+  } catch (err) {
+    console.error('FastAPI backend proxy failed:', err)
+  }
+
+  return {
+    success: false,
+    message: 'Could not communicate with the Revit plugin. Please check that Revit is running.',
+  }
+})
 
 
 app.whenReady().then(() => {
