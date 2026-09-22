@@ -126,6 +126,7 @@ def current_project():
     if info and info.get("success"):
         return {
             "success": True,
+            "live": info.get("live", False),
             "project_id": info.get("project_id"),
             "project_name": info.get("project_name"),
             "file_path": info.get("file_path"),
@@ -133,6 +134,7 @@ def current_project():
         }
     return {
         "success": False,
+        "live": False,
         "message": "No active Revit project is currently connected.",
     }
 

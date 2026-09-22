@@ -31,9 +31,8 @@ def get_db_connection():
 # REVIT PLUGIN
 # ============================================================
 
-REVIT_PLUGIN_URL = (
-    "http://127.0.0.1:8765/current-project"
-)
+CANDIDATE_PORTS = [8765, 8766, 8767, 8768, 8769, 8770]
+REVIT_PLUGIN_URL = "http://127.0.0.1:8765/current-project"
 
 
 def normalize_file_path(path: str | None) -> str | None:
@@ -47,23 +46,20 @@ def normalize_file_path(path: str | None) -> str | None:
 
 
 def get_active_project_info() -> dict | None:
-    # 1. Primary: Query Revit Plugin HTTP listener
-    try:
-        request = urllib.request.Request(
-            REVIT_PLUGIN_URL,
-            method="GET",
-        )
-        with urllib.request.urlopen(
-            request,
-            timeout=2,
-        ) as response:
-            payload = json.loads(
-                response.read().decode("utf-8")
-            )
-            if payload and payload.get("success"):
-                return payload
-    except Exception:
-        pass
+    # 1. Primary: Query Revit Plugin HTTP listener across candidate ports
+    for port in CANDIDATE_PORTS:
+        try:
+            url = f"http://127.0.0.1:{port}/current-project"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=0.4) as response:
+                if response.status == 200:
+                    payload = json.loads(response.read().decode("utf-8"))
+                    if payload and payload.get("success"):
+                        payload["live"] = True
+                        payload["port"] = port
+                        return payload
+        except Exception:
+            continue
 
     # 2. Database Fallback: Query PostgreSQL for most recently active project
     try:
@@ -82,6 +78,7 @@ def get_active_project_info() -> dict | None:
                     p_id, p_name, p_path = row
                     return {
                         "success": True,
+                        "live": False,
                         "project_id": p_id,
                         "project_name": p_name,
                         "file_path": p_path,

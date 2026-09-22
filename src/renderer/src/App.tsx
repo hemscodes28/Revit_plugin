@@ -36,13 +36,16 @@ function App() {
           const data = await res.json()
           if (data.success && data.project_name) {
             setActiveProjectName(data.project_name)
-            setIsConnected(true)
-          } else if (data.success === false) {
+            setIsConnected(Boolean(data.live))
+          } else {
             setActiveProjectName(null)
+            setIsConnected(false)
           }
+        } else {
+          setIsConnected(false)
         }
       } catch {
-        // Backend offline or unreachable
+        setIsConnected(false)
       }
     }
 
@@ -159,11 +162,15 @@ function App() {
       }
 
       if (res && !res.success) {
-        setError(res.message || 'Revit action failed.')
+        setIsConnected(false)
+        setError(res.message || 'Revit action failed. Please check that Revit is running.')
+      } else if (res && res.success) {
+        setIsConnected(true)
       }
     } catch (err) {
       console.error('Revit action error:', err)
-      setError('Could not communicate with the Revit plugin.')
+      setIsConnected(false)
+      setError('Could not communicate with the Revit plugin. Please check that Revit is running.')
     }
   }
 

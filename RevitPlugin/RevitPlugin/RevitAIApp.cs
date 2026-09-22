@@ -291,7 +291,29 @@ namespace RevitPlugin
             }
         }
 
-        private void StartHttpServer()
+        public static void EnsureHttpServerRunning()
+        {
+            try
+            {
+                if (!serverRunning || httpListener == null || (httpServerThread != null && !httpServerThread.IsAlive))
+                {
+                    serverRunning = false;
+                    if (httpListener != null)
+                    {
+                        try { httpListener.Close(); } catch { }
+                        httpListener = null;
+                    }
+                    Log("EnsureHttpServerRunning: Starting/restarting HTTP server...");
+                    StartHttpServer();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("EnsureHttpServerRunning ERROR: " + ex.Message);
+            }
+        }
+
+        private static void StartHttpServer()
         {
             if (serverRunning)
             {
@@ -314,7 +336,7 @@ namespace RevitPlugin
                 "HTTP server thread started on candidate ports 8765-8770.");
         }
 
-        private void HttpServerLoop()
+        private static void HttpServerLoop()
         {
             HttpListener listener = null;
             int boundPort = -1;
@@ -387,7 +409,7 @@ namespace RevitPlugin
             Log("HTTP server stopped");
         }
 
-        private void HandleRequest(
+        private static void HandleRequest(
             HttpListenerContext context)
         {
             try
@@ -570,7 +592,7 @@ namespace RevitPlugin
             }
         }
 
-        private string GetCachedOrDatabaseProjectResponse()
+        private static string GetCachedOrDatabaseProjectResponse()
         {
             try
             {
@@ -622,7 +644,7 @@ namespace RevitPlugin
             return "{\"success\":false,\"message\":\"No active Revit project is currently connected.\"}";
         }
 
-        private void SendHttpResponse(
+        private static void SendHttpResponse(
             HttpListenerContext context,
             int statusCode,
             string contentType,
@@ -2310,6 +2332,8 @@ namespace RevitPlugin
 
                 RevitAIApp.Log(
                     "RevitAI button clicked");
+
+                RevitAIApp.EnsureHttpServerRunning();
 
                 // ====================================================
                 // START FASTAPI AUTOMATICALLY
